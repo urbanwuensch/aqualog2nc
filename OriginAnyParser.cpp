@@ -93,7 +93,7 @@ bool OriginAnyParser::parse()
     d_file_size = file.tellg();
     file.seekg(0, ios_base::beg);
 
-    LOG_PRINT(logfile, "File size: %" PRId64 "\n", d_file_size)
+    LOG_PRINT(logfile, "File size: %" PRId64 "\n", static_cast<int64_t>(d_file_size))
 
     // get file and program version, check it is a valid file
     readFileVersion();
