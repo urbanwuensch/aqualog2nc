@@ -1538,6 +1538,12 @@ void OriginAnyParser::getLayerProperties(const string &lye_header, unsigned int 
     } else if (iexcel != -1) { // excel
 
         excels[iexcel].loose = false;
+	if (lye_header_size > 0x12d) {
+		ilayer = (unsigned char)lye_header[0x12d];
+		LOG_PRINT(logfile, "  Apparent layer index = %d\n", ilayer)
+        }
+        if ((unsigned int)ilayer >= excels[iexcel].sheets.size())
+		excels[iexcel].sheets.resize(ilayer + 1);
         if (lye_header_size > 0xD2) {
             excels[iexcel].sheets[ilayer].name = lye_header.substr(0xD2, 32).c_str();
         }
