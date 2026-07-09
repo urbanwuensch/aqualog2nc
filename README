@@ -3,6 +3,8 @@ liborigin, standalone version
 
 This code is a standalone library for reading OriginLab project files.
 
+Development repository: https://github.com/gerlachs/liborigin
+
 It is based on the code at
 	http://sourceforge.net/projects/liborigin (upstream)
 	https://github.com/SciDAVis/liborigin
