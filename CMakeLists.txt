@@ -2,7 +2,7 @@
 cmake_minimum_required(VERSION 3.16.3)
 
 project( liborigin
-    VERSION 3.0.3
+    VERSION 3.0.4
     LANGUAGES CXX
 )
 
