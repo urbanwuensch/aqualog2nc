@@ -500,7 +500,7 @@ private:
     class compare_nodes
     {
     public:
-        compare_nodes(StrictWeakOrdering comp) : comp_(comp){};
+        compare_nodes(StrictWeakOrdering comp) : comp_(comp) { };
 
         bool operator()(const tree_node *a, const tree_node *b)
         {
