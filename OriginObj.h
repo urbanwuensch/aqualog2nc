@@ -1097,6 +1097,8 @@ struct Graph : public Window
     std::vector<GraphLayer> layers;
     unsigned short width;
     unsigned short height;
+    unsigned short dpiX;
+    unsigned short dpiY;
     bool is3D;
     bool isLayout;
     bool connectMissingData;
@@ -1106,6 +1108,8 @@ struct Graph : public Window
         : Window(_name),
           width(400),
           height(300),
+          dpiX(0),
+          dpiY(0),
           is3D(false),
           isLayout(false),
           connectMissingData(false) { };
