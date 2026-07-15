@@ -14,6 +14,11 @@
 
 #include <sstream>
 #include <cinttypes>
+#include <algorithm>
+#include <charconv>
+#include <optional>
+#include <string_view>
+#include <vector>
 
 using namespace std;
 
@@ -2153,6 +2158,104 @@ void OriginAnyParser::getAnnotationProperties(const string &anhd, unsigned int a
     return;
 }
 
+namespace {
+
+constexpr std::string_view kSigil = "@${[";
+constexpr std::string_view kHeaderEnd = "]}";
+
+bool isXmlMetadataSection(std::string_view name)
+{
+    return name == "TREE" || name == "ColComment" || name == "VarInfo"
+            || name == "Organizer" || name == "Script" || name == "ExperimentProperties";
+}
+
+std::string_view withoutTrailingCr(std::string_view text)
+{
+    if (!text.empty() && text.back() == '\r')
+        text.remove_suffix(1);
+    return text;
+}
+
+std::string_view takeLine(std::string_view &text)
+{
+    const std::string_view::size_type end = text.find('\n');
+    const std::string_view line = text.substr(0, end);
+    text.remove_prefix(end == std::string_view::npos ? text.size() : end + 1);
+    return withoutTrailingCr(line);
+}
+
+void parseColumnLabel(std::string_view cvedt, Origin::SpreadColumn &column)
+{
+    std::string_view label = cvedt.substr(0, std::min(cvedt.find(kSigil), cvedt.find('\0')));
+    column.longName = std::string(takeLine(label));
+    column.units = std::string(takeLine(label));
+    column.comment = std::string(withoutTrailingCr(label));
+}
+
+std::vector<std::string_view> splitFields(std::string_view text, char separator)
+{
+    std::vector<std::string_view> fields;
+    std::string_view::size_type end = text.find(separator);
+    while (end != std::string_view::npos) {
+        fields.push_back(text.substr(0, end));
+        text.remove_prefix(end + 1);
+        end = text.find(separator);
+    }
+    fields.push_back(text);
+    return fields;
+}
+
+struct StorageRecord {
+    std::string name;
+    std::string_view payload;
+};
+
+std::optional<StorageRecord> takeStorageRecord(std::string_view &text)
+{
+    constexpr std::size_t kNameField = 2, kSizeField = 3, kHeaderFieldCount = 5;
+
+    if (text.substr(0, kSigil.size()) != kSigil)
+        return std::nullopt;
+
+    const std::string_view::size_type fieldsEnd = text.find(kHeaderEnd, kSigil.size());
+    if (fieldsEnd == std::string_view::npos)
+        return std::nullopt;
+
+    const std::vector<std::string_view> fields =
+            splitFields(text.substr(kSigil.size(), fieldsEnd - kSigil.size()), '|');
+    if (fields.size() < kHeaderFieldCount)
+        return std::nullopt;
+
+    const std::string_view sizeField = fields[kSizeField];
+    const char *const sizeEnd = sizeField.data() + sizeField.size();
+    std::string_view::size_type size = 0;
+    const auto result = std::from_chars(sizeField.data(), sizeEnd, size);
+    if (result.ec != std::errc() || result.ptr != sizeEnd)
+        return std::nullopt;
+
+    const std::string_view::size_type payloadStart = fieldsEnd + kHeaderEnd.size();
+    if (payloadStart > text.size() || size > text.size() - payloadStart)
+        return std::nullopt;
+
+    const StorageRecord record{ std::string(fields[kNameField]),
+                                text.substr(payloadStart, size) };
+    text.remove_prefix(payloadStart + size);
+    return record;
+}
+
+std::vector<Origin::MetadataRecord> parseColumnMetadata(std::string_view cvedt)
+{
+    std::vector<Origin::MetadataRecord> records;
+    std::string_view rest = cvedt.substr(std::min(cvedt.find(kSigil), cvedt.size()));
+    while (std::optional<StorageRecord> record = takeStorageRecord(rest)) {
+        if (isXmlMetadataSection(record->name))
+            records.push_back({ std::move(record->name), std::string(record->payload) });
+    }
+    return records;
+}
+
+}
+
 void OriginAnyParser::getCurveProperties(const string &cvehd, unsigned int cvehdsz,
                                          const string &cvedt, unsigned int cvedtsz)
 {
@@ -2253,7 +2356,8 @@ void OriginAnyParser::getCurveProperties(const string &cvehd, unsigned int cvehd
                 break;
             }
             if (cvedtsz > 0) {
-                spreadSheets[ispread].columns[col_index].comment = cvedt.c_str();
+                parseColumnLabel(cvedt, spreadSheets[ispread].columns[col_index]);
+                spreadSheets[ispread].columns[col_index].metadata = parseColumnMetadata(cvedt);
             }
             // TODO: check that spreadsheet columns are stored in proper order
             // header.push_back(spreadSheets[ispread].columns[col_index]);
@@ -2374,7 +2478,9 @@ void OriginAnyParser::getCurveProperties(const string &cvehd, unsigned int cvehd
                 break;
             }
             if (cvedtsz > 0) {
-                excels[iexcel].sheets[isheet].columns[col_index].comment = cvedt.c_str();
+                parseColumnLabel(cvedt, excels[iexcel].sheets[isheet].columns[col_index]);
+                excels[iexcel].sheets[isheet].columns[col_index].metadata =
+                        parseColumnMetadata(cvedt);
             }
         }
 

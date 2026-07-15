@@ -339,6 +339,12 @@ private:
     }
 } variant;
 
+struct MetadataRecord
+{
+    std::string name;
+    std::string payload;
+};
+
 struct SpreadColumn
 {
     enum ColumnType { X, Y, Z, XErr, YErr, Label, NONE };
@@ -352,7 +358,10 @@ struct SpreadColumn
     int decimalPlaces;
     NumericDisplayType numericDisplayType;
     std::string command;
+    std::string longName;
+    std::string units;
     std::string comment;
+    std::vector<MetadataRecord> metadata;
     int width;
     unsigned int index;
     unsigned int colIndex;
