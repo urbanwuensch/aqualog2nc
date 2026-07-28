@@ -1488,6 +1488,12 @@ void OriginAnyParser::getWindowProperties(Origin::Window &window, const string &
         GET_SHORT(stmp, graphs[igraph].width)
         GET_SHORT(stmp, graphs[igraph].height)
 
+        if (wde_header_size > 0x5A) {
+            stmp.str(wde_header.substr(0x57));
+            GET_SHORT(stmp, graphs[igraph].dpiX)
+            GET_SHORT(stmp, graphs[igraph].dpiY)
+        }
+
         unsigned char co = wde_header[0x38];
         graphs[igraph].connectMissingData = ((co & 0x40) != 0);
 
