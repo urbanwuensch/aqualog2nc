@@ -1,5 +1,5 @@
 {
-  "name": "hjy2nc",
+  "name": "aqualog2nc",
   "version": "1.0.0",
   "dependencies": [
     "netcdf-cxx4"
