@@ -1,4 +1,11 @@
 # CMakeLists.txt for liborigin
+#
+# aqualog2nc is built with vcpkg providing netCDF-cxx4 - see vcpkg.json.
+# Configure with:
+#   cmake -B build -S . -DCMAKE_TOOLCHAIN_FILE=$VCPKG_ROOT/scripts/buildsystems/vcpkg.cmake -DVCPKG_TARGET_TRIPLET=<triplet>
+# where <triplet> is x64-linux, x64-osx, arm64-osx, or x64-windows-static.
+# See aqualog2nc_deployment_guide.md for the full cross-platform build/release setup.
+
 cmake_minimum_required(VERSION 3.16.3)
 
 project( liborigin
@@ -108,6 +115,32 @@ endif ()
 if (BUILD_STATIC_LIBS)
     add_executable(opj2dat opj2dat.cpp)
     target_link_libraries (opj2dat origin_static)
+
+    add_executable(aqualog2nc aqualog2nc.cpp)
+
+    # Portable, cross-platform netCDF C++ dependency via vcpkg - replaces
+    # the old hardcoded /opt/homebrew paths (macOS-Homebrew-only, and only
+    # on the machine that installed it there). See vcpkg.json for the
+    # dependency declaration and the deployment guide for the full
+    # per-platform build setup.
+    find_package(netCDFCxx CONFIG REQUIRED)
+
+    target_link_libraries(
+        aqualog2nc
+        PRIVATE
+        origin_static
+        netCDF::netcdf-cxx4
+    )
+
+    # aqualog2nc uses std::filesystem (folder batch mode). This is part of
+    # the standard library on all reasonably current compilers; only add
+    # this if your CI build reports an "undefined reference to
+    # std::filesystem" link error (typically GCC < 9 on Linux):
+    # target_link_libraries(aqualog2nc PRIVATE stdc++fs)
+
+    add_executable(inspect inspect.cpp)
+    target_link_libraries(inspect origin_static)
+
 elseif (BUILD_SHARED_LIBS)
     add_executable(opj2dat opj2dat.cpp)
     target_link_libraries (opj2dat origin_shared)
