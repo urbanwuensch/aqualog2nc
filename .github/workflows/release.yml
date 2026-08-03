@@ -63,13 +63,18 @@ jobs:
           # not as a side effect of an unrelated change.
           vcpkgGitCommitId: 'f3e10653cc27d62a37a3763cd84b38bca07c6075'
 
-      - name: Configure
-        shell: bash
-        run: >
-          cmake -B build -S .
-          -DCMAKE_TOOLCHAIN_FILE="${VCPKG_ROOT}/scripts/buildsystems/vcpkg.cmake"
-          -DVCPKG_TARGET_TRIPLET=${{ matrix.triplet }}
-          -DCMAKE_BUILD_TYPE=Release
+      - name: Configure (retries automatically on flaky download mirrors)
+        uses: nick-fields/retry@v3
+        with:
+          timeout_minutes: 30
+          max_attempts: 5
+          retry_wait_seconds: 60
+          shell: bash
+          command: >
+            cmake -B build -S .
+            -DCMAKE_TOOLCHAIN_FILE="${VCPKG_ROOT}/scripts/buildsystems/vcpkg.cmake"
+            -DVCPKG_TARGET_TRIPLET=${{ matrix.triplet }}
+            -DCMAKE_BUILD_TYPE=Release
 
       - name: Build
         run: cmake --build build --config Release --target aqualog2nc
