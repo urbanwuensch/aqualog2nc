@@ -1,0 +1,131 @@
+# .github/workflows/release.yml
+#
+# Builds a static aqualog2nc binary for Linux, macOS (Intel + Apple
+# Silicon), and Windows, and attaches them to a GitHub Release whenever a
+# version tag (e.g. v1.0.0) is pushed. Can also be triggered manually from
+# the Actions tab (workflow_dispatch) to test a build without tagging.
+#
+# FIRST-RUN CHECKLIST (this is a draft - expect to iterate once you run it):
+#   - Requires vcpkg.json at the repo root (declares the netcdf-cxx4 dependency)
+#   - Requires the CMakeLists.txt find_package(netCDFCxx) change
+#   - The vcpkgGitCommitId below pins a specific vcpkg revision so builds
+#     are reproducible - update it deliberately (e.g. periodically bump to
+#     get newer library versions), not silently.
+#   - Confirm the built target is actually named "aqualog2nc" in your
+#     CMakeLists.txt (add_executable(aqualog2nc ...)) - the build step
+#     below targets that name specifically.
+
+name: Build and release aqualog2nc
+
+on:
+  push:
+    tags:
+      - 'v*'
+  workflow_dispatch:  # manual "Run workflow" button in the Actions tab, no tag needed
+
+jobs:
+  build:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-latest
+            triplet: x64-linux
+            artifact: aqualog2nc-linux-x64
+            binary_name: aqualog2nc
+          - os: macos-latest       # Apple Silicon runner
+            triplet: arm64-osx
+            artifact: aqualog2nc-macos-arm64
+            binary_name: aqualog2nc
+          - os: macos-13           # Intel runner
+            triplet: x64-osx
+            artifact: aqualog2nc-macos-x64
+            binary_name: aqualog2nc
+          - os: windows-latest
+            triplet: x64-windows-static
+            artifact: aqualog2nc-windows-x64
+            binary_name: aqualog2nc.exe
+
+    runs-on: ${{ matrix.os }}
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Set up vcpkg
+        uses: lukka/run-vcpkg@v11
+        with:
+          # Pin to a known vcpkg revision for reproducible builds. Update
+          # this on purpose (e.g. when you want newer library versions),
+          # not as a side effect of an unrelated change.
+          vcpkgGitCommitId: 'a42af01b72c28a8e1d7b48107b33e4f286a55ef6'
+
+      - name: Configure
+        shell: bash
+        run: >
+          cmake -B build -S .
+          -DCMAKE_TOOLCHAIN_FILE="${VCPKG_ROOT}/scripts/buildsystems/vcpkg.cmake"
+          -DVCPKG_TARGET_TRIPLET=${{ matrix.triplet }}
+          -DCMAKE_BUILD_TYPE=Release
+
+      - name: Build
+        run: cmake --build build --config Release --target aqualog2nc
+
+      - name: Locate and rename binary (Linux/macOS)
+        if: runner.os != 'Windows'
+        run: |
+          found=$(find build -name "${{ matrix.binary_name }}" -type f | head -n 1)
+          if [ -z "$found" ]; then
+            echo "Could not find built binary '${{ matrix.binary_name }}' under build/ - check the build log above."
+            exit 1
+          fi
+          cp "$found" "${{ matrix.artifact }}"
+          chmod +x "${{ matrix.artifact }}"
+
+      - name: Locate and rename binary (Windows)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          $exe = Get-ChildItem -Path build -Recurse -Filter "${{ matrix.binary_name }}" | Select-Object -First 1
+          if (-not $exe) {
+            Write-Error "Could not find built binary '${{ matrix.binary_name }}' under build/ - check the build log above."
+            exit 1
+          }
+          Copy-Item $exe.FullName "${{ matrix.artifact }}.exe"
+
+      - name: Sanity-check for stray dynamic dependencies (Linux)
+        if: matrix.os == 'ubuntu-latest'
+        run: |
+          echo "Reviewing dynamic dependencies - should be base libc/libstdc++/libm only:"
+          ldd "${{ matrix.artifact }}" || true
+
+      - name: Sanity-check for stray dynamic dependencies (macOS)
+        if: runner.os == 'macOS'
+        run: |
+          echo "Reviewing dynamic dependencies - should show no /opt/homebrew or /usr/local paths:"
+          otool -L "${{ matrix.artifact }}" || true
+
+      - name: Upload build artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.artifact }}
+          path: |
+            ${{ matrix.artifact }}
+            ${{ matrix.artifact }}.exe
+          if-no-files-found: error
+
+  release:
+    needs: build
+    runs-on: ubuntu-latest
+    if: startsWith(github.ref, 'refs/tags/v')
+    steps:
+      - name: Download all build artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: dist
+
+      - name: Publish GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: dist/**/*
+          generate_release_notes: true
