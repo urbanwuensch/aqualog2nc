@@ -61,7 +61,7 @@ jobs:
           # Pin to a known vcpkg revision for reproducible builds. Update
           # this on purpose (e.g. when you want newer library versions),
           # not as a side effect of an unrelated change.
-          vcpkgGitCommitId: 'a42af01b72c28a8e1d7b48107b33e4f286a55ef6'
+          vcpkgGitCommitId: '2026.06.01'
 
       - name: Configure
         shell: bash
