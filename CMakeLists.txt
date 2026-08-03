@@ -138,8 +138,6 @@ if (BUILD_STATIC_LIBS)
     # std::filesystem" link error (typically GCC < 9 on Linux):
     # target_link_libraries(aqualog2nc PRIVATE stdc++fs)
 
-    add_executable(inspect inspect.cpp)
-    target_link_libraries(inspect origin_static)
 
 elseif (BUILD_SHARED_LIBS)
     add_executable(opj2dat opj2dat.cpp)
