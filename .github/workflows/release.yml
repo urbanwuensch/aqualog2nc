@@ -61,6 +61,12 @@ jobs:
           # this on purpose (e.g. when you want newer library versions),
           # not as a side effect of an unrelated change.
           vcpkgGitCommitId: 'f3e10653cc27d62a37a3763cd84b38bca07c6075'
+          
+      - name: Pre-seed vcpkg download cache with local libaec archive
+        shell: bash
+        run: |
+          mkdir -p "${VCPKG_ROOT}/downloads"
+          cp "${{ github.workspace }}/vcpkg-downloads/k202009-libaec-v1.1.6.tar.gz" "${VCPKG_ROOT}/downloads/"
 
       - name: Configure (retries automatically on flaky download mirrors)
         uses: nick-fields/retry@v3
