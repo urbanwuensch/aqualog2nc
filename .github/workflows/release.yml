@@ -1,27 +1,14 @@
-# .github/workflows/release.yml
-#
-# Builds a static aqualog2nc binary for Linux, macOS (Intel + Apple
-# Silicon), and Windows, and attaches them to a GitHub Release whenever a
-# version tag (e.g. v1.0.0) is pushed. Can also be triggered manually from
-# the Actions tab (workflow_dispatch) to test a build without tagging.
-#
-# FIRST-RUN CHECKLIST (this is a draft - expect to iterate once you run it):
-#   - Requires vcpkg.json at the repo root (declares the netcdf-cxx4 dependency)
-#   - Requires the CMakeLists.txt find_package(netCDFCxx) change
-#   - The vcpkgGitCommitId below pins a specific vcpkg revision so builds
-#     are reproducible - update it deliberately (e.g. periodically bump to
-#     get newer library versions), not silently.
-#   - Confirm the built target is actually named "aqualog2nc" in your
-#     CMakeLists.txt (add_executable(aqualog2nc ...)) - the build step
-#     below targets that name specifically.
-
 name: Build and release aqualog2nc
 
 on:
   push:
     tags:
       - 'v*'
-  workflow_dispatch:  # manual "Run workflow" button in the Actions tab, no tag needed
+  workflow_dispatch:
+
+permissions:
+  contents: write
+  actions: read
 
 jobs:
   build:
@@ -48,12 +35,24 @@ jobs:
 
     runs-on: ${{ matrix.os }}
 
+    # Enables GitHub Actions' own cache as a vcpkg binary cache: once a
+    # package (e.g. the flaky libaec download) has been built successfully
+    # ONE time on a given platform, every future run reuses that result
+    # instead of re-downloading/rebuilding it. This is what actually solves
+    # the recurring gitlab.dkrz.de rate-limit problem long-term.
     env:
-      VCPKG_BINARY_SOURCES: clear
+      VCPKG_BINARY_SOURCES: "clear;x-gha,readwrite"
 
     steps:
       - name: Check out repository
         uses: actions/checkout@v4
+
+      # Exposes the ACTIONS_RUNTIME_TOKEN / ACTIONS_CACHE_URL environment
+      # variables vcpkg's GitHub Actions cache backend needs - without this
+      # step, VCPKG_BINARY_SOURCES=x-gha fails with a "requires
+      # ACTIONS_RUNTIME_TOKEN" error.
+      - name: Export GitHub Actions cache environment variables
+        uses: crazy-max/ghaction-github-runtime@v3
 
       - name: Set up vcpkg
         uses: lukka/run-vcpkg@v11
@@ -67,14 +66,13 @@ jobs:
         uses: nick-fields/retry@v3
         with:
           timeout_minutes: 30
-          max_attempts: 5
-          retry_wait_seconds: 60
+          max_attempts: 8
+          retry_wait_seconds: 120
           shell: bash
           command: >
             cmake -B build -S .
             -DCMAKE_TOOLCHAIN_FILE="${VCPKG_ROOT}/scripts/buildsystems/vcpkg.cmake"
             -DVCPKG_TARGET_TRIPLET=${{ matrix.triplet }}
-            -DVCPKG_OVERLAY_PORTS="${{ github.workspace }}/vcpkg-overlays"
             -DCMAKE_BUILD_TYPE=Release
 
       - name: Build
