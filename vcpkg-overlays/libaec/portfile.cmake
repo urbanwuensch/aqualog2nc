@@ -14,6 +14,18 @@ vcpkg_cmake_configure(
 
 vcpkg_cmake_install()
 
+# libaec's own generated libaec-config.cmake unconditionally include()s both
+# a static and a shared "*-targets.cmake" file, regardless of which was
+# actually built. These triplets are static-only, so the shared one never
+# gets generated - which breaks anything (like HDF5) that does
+# find_package(libaec CONFIG). Stubbing it out as an empty file lets that
+# include() succeed harmlessly; nothing in a static build needs it anyway.
+foreach(CFG_DIR "lib/cmake/libaec" "debug/lib/cmake/libaec")
+    if(EXISTS "${CURRENT_PACKAGES_DIR}/${CFG_DIR}/libaec-config.cmake")
+        file(WRITE "${CURRENT_PACKAGES_DIR}/${CFG_DIR}/libaec_shared-targets.cmake" "")
+    endif()
+endforeach()
+
 file(REMOVE_RECURSE "${CURRENT_PACKAGES_DIR}/debug/include")
 
 vcpkg_copy_pdbs()
