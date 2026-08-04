@@ -8,6 +8,16 @@
 
 cmake_minimum_required(VERSION 3.16.3)
 
+# Match the MSVC runtime library used by vcpkg's static triplets
+# (x64-windows-static builds every dependency with /MT). Without this, our
+# own targets default to /MD, which causes LNK2038 "RuntimeLibrary
+# mismatch" errors when linking against those static libraries. Harmless
+# no-op on Linux/macOS.
+if (POLICY CMP0091)
+    cmake_policy(SET CMP0091 NEW)
+endif()
+set(CMAKE_MSVC_RUNTIME_LIBRARY "MultiThreaded$<$<CONFIG:Debug>:Debug>")
+
 project( liborigin
     VERSION 3.0.4
     LANGUAGES CXX
