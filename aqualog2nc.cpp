@@ -758,9 +758,9 @@ int main(int argc, char* argv[])
                 // identifier; the full, untrimmed label is still kept in
                 // the workbook_name attribute below.
                 std::string sampleId = fullLabel;
-                size_t descriptorPos = fullLabel.find("3D ");
+                size_t descriptorPos = fullLabel.find(")");
                 if (descriptorPos != std::string::npos)
-                    sampleId = fullLabel.substr(0, descriptorPos);
+                    sampleId = fullLabel.substr(0, descriptorPos + 1);
 
                 std::string baseName = safeName(sampleId);
                 std::string groupName = uniqueGroupName(nc, baseName);
@@ -771,7 +771,7 @@ int main(int argc, char* argv[])
                 std::cout << "\n";
 
                 NcGroup group = nc.addGroup(groupName);
-                group.putAtt("workbook_name", fullLabel);
+                group.putAtt("workbook_name", sampleId);
                 group.putAtt("workbook_short_name", book.name);
                 group.putAtt("source_opj_file", opjPathStr);
 
