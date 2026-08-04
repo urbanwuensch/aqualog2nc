@@ -2,9 +2,9 @@
 -----------------------------
 
 ## STATUS
+-----------------------------
 
-A few things to know
-
+A few things to know:
 1. This project is heavily based on LLM-generated code (I don't know C++). But I do love open science, and this led me to want to "free" Aqualog data from the proprietary OPJ files to NetCDF.
 2. The project is not finished and not properly documented (as of August 2026). 
 3. The format of the NetCDF file will change slowly over time until v1.0 is released.
