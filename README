@@ -1,8 +1,8 @@
-hjy2nc: Convert data in Origin Pro-type OPJ files containing Horiba AquaLog EEM+Absorbance to NetCDF files.
+# hjy2nc: Convert data in Origin Pro-type OPJ files containing Horiba AquaLog EEM+Absorbance to NetCDF files.
 -----------------------------
 
 
-USAGE INSTRUCTIONS:
+## USAGE INSTRUCTIONS:
 -----------------------------
 
 1. macOS (Apple Silicon only):
@@ -23,18 +23,19 @@ USAGE INSTRUCTIONS:
 3. Linux
 	I don't have a machine running Linux, so I could not produce a walk-through. Expect it to be similar to macOS.
 
-ACKNOWLEDGEMENTS
-----------------
+## ATTRIBUTION
 
-aqualog2nc is based on the liborigin project by Stefan Gerlach and
-other contributors:
+aqualog2nc is derived from the liborigin project:
 
 https://github.com/gerlachs/liborigin
 
-liborigin is licensed under the GNU General Public License v3.0 (GPL-3.0).
+liborigin is licensed under the GNU General Public License version 3 (GPL-3.0).
 
-This project contains modifications and extensions developed for
-extracting Horiba AquaLog EEM and absorbance data and exporting the
-results to NetCDF format.
+aqualog2nc extends liborigin with support for extracting Horiba AquaLog
+EEM and absorbance data and exporting the results to NetCDF.
 
-This software was developed with the assistance of Anthropic Claude Sonnet.
+Original liborigin authors include Stefan Gerlach and contributors.
+See the NOTICE, AUTHORS, and LICENSE/COPYING files for details.
+
+Additional modifications:
+Copyright (C) 2026 Urban Wünsch
