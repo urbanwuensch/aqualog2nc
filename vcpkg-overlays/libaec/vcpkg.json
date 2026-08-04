@@ -4,5 +4,9 @@
   "port-version": 0,
   "description": "libaec - Adaptive Entropy Coding library",
   "homepage": "https://github.com/Deutsches-Klimarechenzentrum/libaec",
-  "license": "BSD-2-Clause"
+  "license": "BSD-2-Clause",
+  "dependencies": [
+    { "name": "vcpkg-cmake", "host": true },
+    { "name": "vcpkg-cmake-config", "host": true }
+  ]
 }
