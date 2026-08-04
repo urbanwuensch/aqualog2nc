@@ -22,3 +22,19 @@ USAGE INSTRUCTIONS:
 
 3. Linux
 	I don't have a machine running Linux, so I could not produce a walk-through. Expect it to be similar to macOS.
+
+ACKNOWLEDGEMENTS
+----------------
+
+aqualog2nc is based on the liborigin project by Stefan Gerlach and
+other contributors:
+
+https://github.com/gerlachs/liborigin
+
+liborigin is licensed under the GNU General Public License v3.0 (GPL-3.0).
+
+This project contains modifications and extensions developed for
+extracting Horiba AquaLog EEM and absorbance data and exporting the
+results to NetCDF format.
+
+This software was developed with the assistance of Anthropic Claude Sonnet.
