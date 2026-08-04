@@ -96,6 +96,7 @@
 #include <sstream>
 #include <string>
 #include <vector>
+#include <cctype>
 
 using namespace netCDF;
 using namespace netCDF::exceptions;
@@ -120,14 +121,38 @@ constexpr double kXCorrectTolerance = 1e-6;
 
 std::string safeName(const std::string& input)
 {
-    std::string out = input;
-    for (char& c : out)
+    std::string out;
+    out.reserve(input.size());
+    for (char c : input)
     {
-        if (c == ' ' || c == '/' || c == '\\' || c == ':' || c == '-' || c == '.')
-            c = '_';
+        if (std::isalnum(static_cast<unsigned char>(c)) || c == '_')
+            out += c;
+        else if (c == '(' || c == ')')
+            continue;  // drop parentheses entirely, e.g. "(01)" -> "01"
+        else
+            out += '_';
     }
+
+    // collapse repeated underscores, and trim from both ends
+    std::string collapsed;
+    collapsed.reserve(out.size());
+    for (char c : out)
+    {
+        if (c == '_' && !collapsed.empty() && collapsed.back() == '_')
+            continue;
+        collapsed += c;
+    }
+    while (!collapsed.empty() && collapsed.front() == '_')
+        collapsed.erase(collapsed.begin());
+    while (!collapsed.empty() && collapsed.back() == '_')
+        collapsed.pop_back();
+    out = collapsed;
+
     if (out.empty())
         out = "unnamed";
+    if (std::isdigit(static_cast<unsigned char>(out[0])))
+        out = "_" + out;
+
     return out;
 }
 
@@ -538,14 +563,9 @@ void writeXCorrect(NcGroup& group, Origin::Excel& book,
 
     if (candidates.size() > 1)
     {
-        std::cout << "    XCorrect: " << candidates.size() << " source(s) found (";
-        for (size_t i = 0; i < candidates.size(); i++)
-            std::cout << (i ? ", " : "") << candidates[i].source;
-        std::cout << "), max discrepancy " << maxDiff << " - using " << candidates.front().source << "\n";
-
         if (maxDiff > kXCorrectTolerance)
         {
-            std::cerr << "  [warn] workbook '" << book.name << "': XCorrect sources disagree by up to "
+            std::cerr << "  [warn] workbook '" << book.label << "': XCorrect sources disagree by up to "
                       << maxDiff << "\n";
         }
     }
@@ -611,11 +631,7 @@ WorkbookAxes buildAxes(NcGroup& group, Origin::Excel& book)
         exVar.putAtt("units", "nm");
         exVar.putVar(excitation.data());
 
-        std::cout << "    excitation axis: " << excitation.size() << " values from " << key;
-        if (rows.size() != sheet->columns[0].data.size())
-            std::cout << " (dropped " << (sheet->columns[0].data.size() - rows.size())
-                      << " out-of-range rows)";
-        std::cout << " - " << excitation.front() << " to " << excitation.back() << " nm\n";
+        
         break;
     }
 
@@ -624,7 +640,7 @@ WorkbookAxes buildAxes(NcGroup& group, Origin::Excel& book)
         size_t matrixCols = emSource->columns.size() - 1;
         if (matrixCols != static_cast<size_t>(axes.exDim.getSize()))
         {
-            std::cerr << "  [warn] workbook '" << book.name << "': EEM matrix has "
+            std::cerr << "  [warn] workbook '" << book.label << "': EEM matrix has "
                       << matrixCols << " columns but the excitation axis has "
                       << axes.exDim.getSize() << " values - under the combined protocol these "
                       << "should match; double check this workbook\n";
@@ -679,14 +695,12 @@ void exportWorkbook(NcGroup& group, Origin::Excel& book)
                     writeNoteMetadata(group, sheet);
                     break;
                 case SheetKind::Unknown:
-                    std::cerr << "  [warn] unrecognized sheet '" << sheet.name
-                              << "' in workbook '" << book.name << "' - skipped\n";
                     break;
             }
         }
         catch (const NcException& e)
         {
-            std::cerr << "  [error] sheet '" << sheet.name << "' in workbook '" << book.name
+            std::cerr << "  [error] sheet '" << sheet.name << "' in workbook '" << book.label
                       << "': " << e.what() << "\n";
         }
     }
@@ -733,17 +747,32 @@ int main(int argc, char* argv[])
 
             for (unsigned int i = 0; i < opj.excelCount(); i++)
             {
-                Origin::Excel& book = opj.excel(i);
-                std::string baseName = safeName(book.name);
+                 Origin::Excel& book = opj.excel(i);
+
+                std::string fullLabel = book.label.empty() ? book.name : book.label;
+
+                // Origin's Aqualog naming template appends a fixed,
+                // non-sample-specific descriptor after " - " (e.g.
+                // "Sample01 (01) - 3D Acquisition EEM 3D CCD - Absorbance").
+                // Only the part before that separator is the actual sample
+                // identifier; the full, untrimmed label is still kept in
+                // the workbook_name attribute below.
+                std::string sampleId = fullLabel;
+                size_t descriptorPos = fullLabel.find("3D ");
+                if (descriptorPos != std::string::npos)
+                    sampleId = fullLabel.substr(0, descriptorPos);
+
+                std::string baseName = safeName(sampleId);
                 std::string groupName = uniqueGroupName(nc, baseName);
 
-                std::cout << "  Exporting sample: " << book.name;
+                std::cout << "  Exporting sample: " << sampleId;
                 if (groupName != baseName)
                     std::cout << " (name collision - stored as '" << groupName << "')";
                 std::cout << "\n";
 
                 NcGroup group = nc.addGroup(groupName);
-                group.putAtt("workbook_name", book.name);
+                group.putAtt("workbook_name", fullLabel);
+                group.putAtt("workbook_short_name", book.name);
                 group.putAtt("source_opj_file", opjPathStr);
 
                 std::string created = formatTimestampUtc(book.creationDate);
