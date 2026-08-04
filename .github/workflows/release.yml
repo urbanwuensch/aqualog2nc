@@ -24,10 +24,6 @@ jobs:
             triplet: arm64-osx
             artifact: aqualog2nc-macos-arm64
             binary_name: aqualog2nc
-          - os: macos-13           # Intel runner
-            triplet: x64-osx
-            artifact: aqualog2nc-macos-x64
-            binary_name: aqualog2nc
           - os: windows-latest
             triplet: x64-windows-static
             artifact: aqualog2nc-windows-x64
