@@ -74,6 +74,7 @@ jobs:
             cmake -B build -S .
             -DCMAKE_TOOLCHAIN_FILE="${VCPKG_ROOT}/scripts/buildsystems/vcpkg.cmake"
             -DVCPKG_TARGET_TRIPLET=${{ matrix.triplet }}
+            -DVCPKG_OVERLAY_PORTS="${{ github.workspace }}/vcpkg-overlays"
             -DCMAKE_BUILD_TYPE=Release
 
       - name: Build
