@@ -1,4 +1,4 @@
-# hjy2nc: Convert data in Origin Pro-type OPJ files containing Horiba AquaLog EEM+Absorbance to NetCDF files.
+# aqualog2nc: Convert data in Origin Pro-type OPJ files containing Horiba AquaLog EEM+Absorbance to NetCDF files.
 -----------------------------
 
 
