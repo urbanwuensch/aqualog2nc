@@ -1,6 +1,16 @@
 # aqualog2nc: Convert data in Origin Pro-type OPJ files containing Horiba AquaLog EEM+Absorbance to NetCDF files.
 -----------------------------
 
+## STATUS
+
+A few things to know
+
+1. This project is heavily based on LLM-generated code (I don't know C++). But I do love open science, and this led me to want to "free" Aqualog data from the proprietary OPJ files to NetCDF.
+2. The project is not finished and not properly documented (as of August 2026). 
+3. The format of the NetCDF file will change slowly over time until v1.0 is released.
+4. Due to 3., the drEEM toolbox for MATLAB currently does not yet support reading in the NetCDF files
+5. The NetCDF file content is not yet verified. Use at your own risk. Get involved to speed things up!
+
 
 ## USAGE INSTRUCTIONS:
 -----------------------------
@@ -22,6 +32,20 @@
 
 3. Linux
 	I don't have a machine running Linux, so I could not produce a walk-through. Expect it to be similar to macOS.
+
+## GETTING INVOLVED
+-----------------------------
+
+Contributions, bug reports, and feature requests are welcome.
+
+If you encounter a problem, please open a GitHub issue and include:
+
+- Your operating system and version
+- The aqualog2nc release version
+- A description of the problem
+- Any error messages produced by the program
+- A sample OPJ file, if you want me to fix the issue quickly
+
 
 ## ATTRIBUTION
 -----------------------------
