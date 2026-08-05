@@ -8,7 +8,7 @@
 //
 // Every workbook in every input .opj becomes its own top-level NetCDF
 // group, each with its own independent emission/excitation axes AND its
-// own XCorrect/Mcorrect variables - there is no assumption that different
+// own XCorrect/MCorrect variables - there is no assumption that different
 // samples share a common wavelength grid or correction factors. This
 // means a folder can safely accumulate samples measured with different
 // settings (even by accident) without corrupting each other.
@@ -50,7 +50,7 @@
 // all represent the same physical quantity. writeXCorrect() gathers
 // whichever of these exist for a workbook, compares them, and writes a
 // single "XCorrect" variable (preferring R1andR1cBlank as the canonical
-// source, matching aqualogimport.m's Xout.XCorrect). Mcorrect has only
+// source, matching aqualogimport.m's Xout.XCorrect). MCorrect has only
 // ever had one source, so it's unchanged, still written per-workbook on
 // the emission axis.
 //
@@ -89,7 +89,7 @@
 //   2) S1Sample/S1Blank column count    == excitation axis length
 //   3) AbsSpectrumSample/Blank row count == excitation axis length
 //   4) R1andR1cSample/Blank row count    == excitation axis length
-//   5) S1DarkandMcorrectSample/Blank row count == emission axis length
+//   5) S1DarkandMCorrectSample/Blank row count == emission axis length
 // (excitation vs. XCorrect is covered by checks 3/4, since XCorrect is
 // sourced from those same sheets). If any sheet disagrees - typically an
 // acquisition that was aborted partway through, leaving some sheets
@@ -122,7 +122,7 @@
 //   - Worksheet short names may contain spaces/separators the way Origin
 //     displays them (e.g. "S1 Sample"); normalizeSheetName() strips the
 //     same characters aqualogimport.m does before comparing.
-//   - S1DarkandMcorrectSample/Blank's column 0 is an emission wavelength
+//   - S1DarkandMCorrectSample/Blank's column 0 is an emission wavelength
 //     axis, following the same column-0-is-the-axis convention as every
 //     other sheet type here - inferred from the established pattern, not
 //     independently confirmed against this specific sheet.
@@ -487,7 +487,7 @@ ValidationResult validateWorkbookAxes(Origin::Excel& book)
         }
     }
 
-    // Check 5: S1DarkandMcorrect sheets (Mcorrect's source) - row count
+    // Check 5: S1DarkandMCorrect sheets (MCorrect's source) - row count
     // must match the emission axis.
     for (const char* key : {"S1DarkandMcorrectSample", "S1DarkandMcorrectBlank"})
     {
@@ -519,8 +519,8 @@ enum class SheetKind
     MatrixBlank,             // S1Blank
     ExcitationVectorSample,  // R1andR1cSample - R1, R1dark
     ExcitationVectorBlank,   // R1andR1cBlank  - R1, R1dark (XCorrect handled separately)
-    EmissionVectorSample,    // S1DarkandMcorrectSample - S1Dark
-    EmissionVectorBlank,     // S1DarkandMcorrectBlank  - S1Dark, Mcorrect
+    EmissionVectorSample,    // S1DarkandMCorrectSample - S1Dark
+    EmissionVectorBlank,     // S1DarkandMCorrectBlank  - S1Dark, MCorrect
     AbsSample,               // AbsSpectrumSample
     AbsBlank,                // AbsSpectrumBlank
     Unknown                  // anything not recognized - warn, don't crash
@@ -624,8 +624,8 @@ void writeExcitationVector(NcGroup& group, Origin::SpreadSheet& sheet,
     group.putAtt("R1dark_" + label, ncDouble, r1dark);
 }
 
-// S1DarkandMcorrectSample / S1DarkandMcorrectBlank: one row per emission
-// wavelength, no reversal. Mcorrect has only ever had one source sheet
+// S1DarkandMCorrectSample / S1DarkandMCorrectBlank: one row per emission
+// wavelength, no reversal. MCorrect has only ever had one source sheet
 // (the Blank one), so it's written directly here rather than through the
 // comparison routine used for XCorrect.
 void writeEmissionVector(NcGroup& group, Origin::SpreadSheet& sheet,
@@ -645,9 +645,9 @@ void writeEmissionVector(NcGroup& group, Origin::SpreadSheet& sheet,
 
     if (label == "Blank" && sheet.columns.size() > 2)
     {
-        std::vector<double> mcorrect = gatherValues(sheet.columns[2], emRows);
-        NcVar mVar = group.addVar("Mcorrect", ncDouble, emDim);
-        mVar.putVar(mcorrect.data());
+        std::vector<double> MCorrect = gatherValues(sheet.columns[2], emRows);
+        NcVar mVar = group.addVar("MCorrect", ncDouble, emDim);
+        mVar.putVar(MCorrect.data());
     }
 }
 
