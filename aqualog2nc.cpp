@@ -33,19 +33,17 @@
 // excitation grid and the absorbance wavelength grid are always identical,
 // so they share a single "excitation" axis per workbook (sourced from
 // whichever of R1andR1cSample/Blank or AbsSpectrumSample/Blank is found
-// first in that workbook). Which sheet won is only printed to the console,
-// not stored as a file attribute.
+// first in that workbook).
 //
 // XCORRECT CONSOLIDATION
 // Up to three sheets can each carry a copy of the excitation correction
 // factor (R1andR1cBlank, R1andR1cSample, AbsSpectrumBlank) - these should
 // all represent the same physical quantity. writeXCorrect() gathers
-// whichever of these exist for a workbook, compares them, prints the
-// largest discrepancy found to the console, and writes a single
-// "XCorrect" variable (preferring R1andR1cBlank as the canonical source,
-// matching aqualogimport.m's Xout.XCorrect). Mcorrect has only ever had
-// one source, so it's unchanged, still written per-workbook on the
-// emission axis.
+// whichever of these exist for a workbook, compares them, and writes a
+// single "XCorrect" variable (preferring R1andR1cBlank as the canonical
+// source, matching aqualogimport.m's Xout.XCorrect). Mcorrect has only
+// ever had one source, so it's unchanged, still written per-workbook on
+// the emission axis.
 //
 // SAMPLE TIMESTAMPS
 // Origin::Excel inherits Window::creationDate / Window::modificationDate
@@ -53,40 +51,73 @@
 // These are written per-workbook as "creation_time" / "modification_time"
 // ISO-8601 UTC string attributes.
 //
+// SAMPLE NAMING
+// Origin::Window::name is the short internal identifier (e.g. "Book1") -
+// not what Origin displays, and not what aqualogimport.m uses.
+// Origin::Window::label is the long, human-readable name (with Origin's
+// own "(01)" auto-numbering for reused base names), matching MATLAB's
+// LongName. Aqualog's naming template appends a fixed, non-sample-specific
+// descriptor after the identifier (e.g. "AO22020 (01) - 3D Acquisition EEM
+// 3D CCD - Absorbance"); only the part through the closing parenthesis is
+// used for the group name - the full label is still kept untouched in the
+// workbook_name attribute.
+//
+// PRE-EXPORT CONSISTENCY VALIDATION
+// Before anything is written for a workbook, validateWorkbookAxes() checks
+// that every axis-bearing sheet agrees on the emission/excitation counts:
+//   0) an S1Sample sheet must exist at all - its absence means this
+//      workbook is a blank measurement, not a sample, and is skipped with
+//      its own distinct diagnostic message (isBlank on the result)
+//   1) S1Sample row count               == emission axis length
+//   2) S1Sample/S1Blank column count    == excitation axis length
+//   3) AbsSpectrumSample/Blank row count == excitation axis length
+//   4) R1andR1cSample/Blank row count    == excitation axis length
+//   5) S1DarkandMcorrectSample/Blank row count == emission axis length
+// (excitation vs. XCorrect is covered by checks 3/4, since XCorrect is
+// sourced from those same sheets). If any sheet disagrees - typically an
+// acquisition that was aborted partway through, leaving some sheets
+// truncated relative to others - the whole sample is skipped before any
+// NetCDF group is created, rather than exported with silent NaN gaps.
+//
 // BATCH MODE / GROUP NAME COLLISIONS
 // Two different .opj files can each contain a workbook with the same name
 // (e.g. both call it "Sample_1"). uniqueGroupName() appends a numeric
 // suffix in that case, and every group also gets a source_opj_file
 // attribute so you can always trace a sample back to its origin file.
+// Collision tracking uses an in-memory set of names already used, rather
+// than repeatedly querying the NetCDF file's existing groups - the latter
+// gets slower as the file accumulates more groups (effectively O(n) per
+// lookup), which shows up as a visible per-sample slowdown over a large
+// batch; the in-memory set keeps each lookup O(1) on average regardless
+// of how many samples have already been written.
 //
 // ASSUMPTIONS TO VERIFY AGAINST YOUR OriginObj.h / OriginFile.h:
 //   - Origin::Variant has type() returning V_DOUBLE or V_STRING, plus
-//     as_double() / as_string(). Origin::Window has time_t creationDate
-//     and modificationDate. (Both confirmed against the public liborigin
-//     fork's OriginObj.h - your local copy may differ slightly.)
+//     as_double() / as_string(). Origin::Window has time_t creationDate,
+//     modificationDate, and string name/label. (Confirmed against the
+//     public liborigin fork's OriginObj.h - your local copy may differ
+//     slightly.)
 //   - Origin::SpreadSheet::columns[i].data is a vector<Origin::Variant>.
-//   - The "Note" worksheet's entire text lives in a single Variant
-//     (columns[0].data[0]) as one \n-delimited string, matching
-//     worksheetData{1} in aqualogimport.m.
 //   - Worksheet short names may contain spaces/separators the way Origin
 //     displays them (e.g. "S1 Sample"); normalizeSheetName() strips the
 //     same characters aqualogimport.m does before comparing.
+//   - S1DarkandMcorrectSample/Blank's column 0 is an emission wavelength
+//     axis, following the same column-0-is-the-axis convention as every
+//     other sheet type here - inferred from the established pattern, not
+//     independently confirmed against this specific sheet.
 //   - Different sheets in the same workbook share the same raw row
 //     layout/padding, so row indices computed from one sheet's axis
 //     column are valid to reuse when reading another sheet's data
 //     columns (including the different XCorrect source sheets). This
 //     should hold for a single combined acquisition run; the diagnostic
 //     printouts below will make it obvious if it doesn't.
-//   - NcGroup::getGroup(name) returns a null NcGroup (isNull() == true)
-//     when no child group of that name exists yet, matching the
-//     getDim()/getVar() convention used elsewhere in netcdf-cxx4. Double
-//     check this against your installed netcdf-cxx4 version.
 
 #include "OriginFile.h"
 
 #include <netcdf>
 
 #include <algorithm>
+#include <cctype>
 #include <cmath>
 #include <ctime>
 #include <filesystem>
@@ -95,8 +126,8 @@
 #include <limits>
 #include <sstream>
 #include <string>
+#include <unordered_set>
 #include <vector>
-#include <cctype>
 
 using namespace netCDF;
 using namespace netCDF::exceptions;
@@ -119,6 +150,11 @@ constexpr double kXCorrectTolerance = 1e-6;
 // Small helpers
 // ---------------------------------------------------------------------
 
+// Keeps only letters, digits, and underscores (dropping parentheses
+// entirely rather than substituting them, e.g. "(01)" -> "01"), collapses
+// repeated underscores, and trims them from both ends. Used for NetCDF
+// group/variable names, which are far stricter about allowed characters
+// than Origin's own sample-naming conventions.
 std::string safeName(const std::string& input)
 {
     std::string out;
@@ -128,12 +164,11 @@ std::string safeName(const std::string& input)
         if (std::isalnum(static_cast<unsigned char>(c)) || c == '_')
             out += c;
         else if (c == '(' || c == ')')
-            continue;  // drop parentheses entirely, e.g. "(01)" -> "01"
+            continue;
         else
             out += '_';
     }
 
-    // collapse repeated underscores, and trim from both ends
     std::string collapsed;
     collapsed.reserve(out.size());
     for (char c : out)
@@ -175,13 +210,6 @@ double variantToDouble(const Origin::Variant& v)
     if (v.type() == Origin::Variant::V_DOUBLE)
         return v.as_double();
     return kNaN;
-}
-
-std::string variantToString(const Origin::Variant& v)
-{
-    if (v.type() == Origin::Variant::V_STRING)
-        return std::string(v.as_string());
-    return std::string();
 }
 
 bool contains(const std::string& s, const std::string& k)
@@ -253,18 +281,21 @@ std::vector<double> gatherValues(Origin::SpreadColumn& col, const std::vector<si
     return out;
 }
 
-// Appends a numeric suffix if a group of this name already exists at the
-// top level of `nc` (can happen when two different .opj files each have a
-// workbook with the same name).
-std::string uniqueGroupName(NcFile& nc, const std::string& baseName)
+// Appends a numeric suffix if `baseName` is already present in `usedNames`
+// (populated as groups are created). Checking against this in-memory set
+// is O(1) on average regardless of how many samples have already been
+// processed - unlike repeatedly querying the NetCDF file's existing
+// groups, which gets slower as the file grows and was the main cause of a
+// visible per-sample slowdown over large batches.
+std::string uniqueGroupName(std::unordered_set<std::string>& usedNames, const std::string& baseName)
 {
-    if (nc.getGroup(baseName).isNull())
+    if (usedNames.insert(baseName).second)
         return baseName;
 
     for (int suffix = 2;; suffix++)
     {
         std::string candidate = baseName + "_" + std::to_string(suffix);
-        if (nc.getGroup(candidate).isNull())
+        if (usedNames.insert(candidate).second)
             return candidate;
     }
 }
@@ -304,6 +335,159 @@ std::vector<fs::path> collectOpjFiles(const fs::path& input)
 }
 
 // ---------------------------------------------------------------------
+// Pre-export consistency validation
+// ---------------------------------------------------------------------
+
+struct ValidationResult
+{
+    bool ok = true;
+    bool isBlank = false;  // true specifically when there's no S1Sample sheet at all
+    std::vector<std::string> reasons;
+};
+
+// Checks that every axis-bearing sheet in the workbook agrees on the
+// emission/excitation counts before anything is written. See the
+// PRE-EXPORT CONSISTENCY VALIDATION note at the top of this file for the
+// full list of checks.
+ValidationResult validateWorkbookAxes(Origin::Excel& book)
+{
+    ValidationResult result;
+
+    // A workbook with no S1Sample sheet at all is a blank measurement, not
+    // a sample - S1Blank alone doesn't establish a real emission axis for
+    // export purposes here, so it's skipped with its own distinct message
+    // rather than folded into the generic "failed consistency checks" path.
+    Origin::SpreadSheet* emSource = findSheet(book, "S1Sample");
+    if (!emSource)
+    {
+        result.ok = false;
+        result.isBlank = true;
+        result.reasons.push_back(
+            "no S1Sample sheet found - this workbook looks like a blank measurement, not a sample");
+        return result;
+    }
+
+    if (emSource->columns.empty())
+    {
+        result.ok = false;
+        result.reasons.push_back("S1Sample sheet has no columns");
+        return result;
+    }
+
+    size_t emissionCount = validAscendingRowOrder(emSource->columns[0]).size();
+    if (emissionCount == 0)
+    {
+        result.ok = false;
+        result.reasons.push_back("emission axis has zero valid (in-range) rows");
+        return result;
+    }
+
+    Origin::SpreadSheet* exSource = nullptr;
+    for (const char* key : {"R1andR1cSample", "R1andR1cBlank", "AbsSpectrumSample", "AbsSpectrumBlank"})
+    {
+        exSource = findSheet(book, key);
+        if (exSource && !exSource->columns.empty())
+            break;
+        exSource = nullptr;
+    }
+
+    if (!exSource)
+    {
+        result.ok = false;
+        result.reasons.push_back("no R1andR1c/AbsSpectrum sheet found to establish the excitation axis");
+        return result;
+    }
+
+    size_t excitationCount = validAscendingRowOrder(exSource->columns[0]).size();
+    if (excitationCount == 0)
+    {
+        result.ok = false;
+        result.reasons.push_back("excitation axis has zero valid (in-range) rows");
+        return result;
+    }
+
+    // Check 1: S1Sample row count must match the emission axis.
+    {
+        size_t rowCount = validAscendingRowOrder(emSource->columns[0]).size();
+        if (rowCount != emissionCount)
+        {
+            result.ok = false;
+            result.reasons.push_back("S1Sample: " + std::to_string(rowCount) +
+                                      " emission rows, expected " + std::to_string(emissionCount));
+        }
+    }
+
+    // Check 2: EEM matrix sheets (S1Sample and, if present, S1Blank) -
+    // column count must match the excitation axis.
+    for (const char* key : {"S1Sample", "S1Blank"})
+    {
+        Origin::SpreadSheet* sheet = findSheet(book, key);
+        if (!sheet || sheet->columns.empty())
+            continue;
+
+        size_t colCount = sheet->columns.size() - 1;
+        if (colCount != excitationCount)
+        {
+            result.ok = false;
+            result.reasons.push_back(std::string(key) + ": " + std::to_string(colCount) +
+                                      " excitation columns, expected " + std::to_string(excitationCount));
+        }
+    }
+
+    // Check 3: absorbance sheets - row count must match the excitation axis.
+    for (const char* key : {"AbsSpectrumSample", "AbsSpectrumBlank"})
+    {
+        Origin::SpreadSheet* sheet = findSheet(book, key);
+        if (!sheet || sheet->columns.empty())
+            continue;
+
+        size_t rowCount = validAscendingRowOrder(sheet->columns[0]).size();
+        if (rowCount != excitationCount)
+        {
+            result.ok = false;
+            result.reasons.push_back(std::string(key) + ": " + std::to_string(rowCount) +
+                                      " absorbance rows, expected " + std::to_string(excitationCount));
+        }
+    }
+
+    // Check 4 (and, since XCorrect is sourced from these same sheets,
+    // check 6): R1andR1c sheets - row count must match the excitation axis.
+    for (const char* key : {"R1andR1cSample", "R1andR1cBlank"})
+    {
+        Origin::SpreadSheet* sheet = findSheet(book, key);
+        if (!sheet || sheet->columns.empty())
+            continue;
+
+        size_t rowCount = validAscendingRowOrder(sheet->columns[0]).size();
+        if (rowCount != excitationCount)
+        {
+            result.ok = false;
+            result.reasons.push_back(std::string(key) + ": " + std::to_string(rowCount) +
+                                      " excitation rows, expected " + std::to_string(excitationCount));
+        }
+    }
+
+    // Check 5: S1DarkandMcorrect sheets (Mcorrect's source) - row count
+    // must match the emission axis.
+    for (const char* key : {"S1DarkandMcorrectSample", "S1DarkandMcorrectBlank"})
+    {
+        Origin::SpreadSheet* sheet = findSheet(book, key);
+        if (!sheet || sheet->columns.empty())
+            continue;
+
+        size_t rowCount = validAscendingRowOrder(sheet->columns[0]).size();
+        if (rowCount != emissionCount)
+        {
+            result.ok = false;
+            result.reasons.push_back(std::string(key) + ": " + std::to_string(rowCount) +
+                                      " emission rows, expected " + std::to_string(emissionCount));
+        }
+    }
+
+    return result;
+}
+
+// ---------------------------------------------------------------------
 // Sheet classification - the C++ equivalent of the MATLAB
 // switch(sheetnames{k}) block
 // ---------------------------------------------------------------------
@@ -319,7 +503,6 @@ enum class SheetKind
     EmissionVectorBlank,     // S1DarkandMcorrectBlank  - S1Dark, Mcorrect
     AbsSample,               // AbsSpectrumSample
     AbsBlank,                // AbsSpectrumBlank
-    Note,                    // Note - free-text metadata
     Unknown                  // anything not recognized - warn, don't crash
 };
 
@@ -337,7 +520,6 @@ SheetKind classifySheet(const std::string& normalizedName)
     if (normalizedName == "S1DarkandMcorrectBlank")  return SheetKind::EmissionVectorBlank;
     if (normalizedName == "AbsSpectrumSample")       return SheetKind::AbsSample;
     if (normalizedName == "AbsSpectrumBlank")        return SheetKind::AbsBlank;
-    if (normalizedName == "Note")                    return SheetKind::Note;
 
     return SheetKind::Unknown;
 }
@@ -474,47 +656,10 @@ void writeAbsSpectrum(NcGroup& group, Origin::SpreadSheet& sheet,
         writeVar("Abs_horiba", 9);
 }
 
-// Note: free-text metadata. Stores key lines plus the full raw text.
-void writeNoteMetadata(NcGroup& group, Origin::SpreadSheet& sheet)
-{
-    if (sheet.columns.empty() || sheet.columns[0].data.empty())
-        return;
-
-    std::string text = variantToString(sheet.columns[0].data[0]);
-    if (text.empty())
-        return;
-
-    auto extractLine = [&](const std::string& prefix) -> std::string {
-        size_t pos = text.find(prefix);
-        if (pos == std::string::npos)
-            return "";
-        pos += prefix.size();
-        size_t end = text.find('\n', pos);
-        std::string value = text.substr(pos, end == std::string::npos ? std::string::npos : end - pos);
-        while (!value.empty() && (value.back() == '\r' || value.back() == '\n'))
-            value.pop_back();
-        return value;
-    };
-
-    std::string experimentType = extractLine("Experiment Type: ");
-    std::string integrationTime = extractLine("Integration Time: ");
-    std::string emPark = extractLine("Park: ");
-
-    if (!experimentType.empty())
-        group.putAtt("note_experiment_type", experimentType);
-    if (!integrationTime.empty())
-        group.putAtt("note_integration_time", integrationTime);
-    if (!emPark.empty())
-        group.putAtt("note_em_park_position", emPark);
-
-    group.putAtt("note_raw_text", text);
-}
-
 // XCorrect: up to three sheets can each carry a copy of this correction
 // factor - R1andR1cBlank (column 3), R1andR1cSample (column 3, if
 // present), and AbsSpectrumBlank (column 5). Gathers whichever exist,
 // compares them, and writes exactly one "XCorrect" variable per workbook.
-// The winning source and any discrepancy are printed to the console only.
 struct XCorrectCandidate
 {
     std::string source;
@@ -561,13 +706,10 @@ void writeXCorrect(NcGroup& group, Origin::Excel& book,
         }
     }
 
-    if (candidates.size() > 1)
+    if (candidates.size() > 1 && maxDiff > kXCorrectTolerance)
     {
-        if (maxDiff > kXCorrectTolerance)
-        {
-            std::cerr << "  [warn] workbook '" << book.label << "': XCorrect sources disagree by up to "
-                      << maxDiff << "\n";
-        }
+        std::cerr << "  [warn] workbook '" << book.label << "': XCorrect sources disagree by up to "
+                  << maxDiff << "\n";
     }
 
     NcVar var = group.addVar("XCorrect", ncDouble, exDim);
@@ -586,13 +728,14 @@ struct WorkbookAxes
     std::vector<size_t> exRows;
 };
 
+// Called only after validateWorkbookAxes() has confirmed the workbook is
+// well-formed - in particular, that S1Sample exists - so no S1Blank
+// fallback is needed here for the emission axis.
 WorkbookAxes buildAxes(NcGroup& group, Origin::Excel& book)
 {
     WorkbookAxes axes;
 
     Origin::SpreadSheet* emSource = findSheet(book, "S1Sample");
-    if (!emSource)
-        emSource = findSheet(book, "S1Blank");
 
     if (emSource && !emSource->columns.empty())
     {
@@ -604,13 +747,6 @@ WorkbookAxes buildAxes(NcGroup& group, Origin::Excel& book)
             NcVar emVar = group.addVar("emission", ncDouble, axes.emDim);
             emVar.putAtt("units", "nm");
             emVar.putVar(emission.data());
-
-            if (axes.emRows.size() != emSource->columns[0].data.size())
-            {
-                std::cout << "    emission axis: " << axes.emRows.size() << " values (dropped "
-                          << (emSource->columns[0].data.size() - axes.emRows.size())
-                          << " out-of-range rows)\n";
-            }
         }
     }
 
@@ -630,8 +766,6 @@ WorkbookAxes buildAxes(NcGroup& group, Origin::Excel& book)
         NcVar exVar = group.addVar("excitation", ncDouble, axes.exDim);
         exVar.putAtt("units", "nm");
         exVar.putVar(excitation.data());
-
-        
         break;
     }
 
@@ -691,9 +825,6 @@ void exportWorkbook(NcGroup& group, Origin::Excel& book)
                 case SheetKind::AbsBlank:
                     writeAbsSpectrum(group, sheet, axes.exDim, axes.exRows, "Blank");
                     break;
-                case SheetKind::Note:
-                    writeNoteMetadata(group, sheet);
-                    break;
                 case SheetKind::Unknown:
                     break;
             }
@@ -733,6 +864,10 @@ int main(int argc, char* argv[])
         nc.putAtt("Conventions", "CF-1.8");
         nc.putAtt("source_input", argv[1]);
 
+        std::unordered_set<std::string> usedGroupNames;
+        unsigned int skippedBlankCount = 0;
+        unsigned int skippedInvalidCount = 0;
+
         for (const auto& opjPath : opjFiles)
         {
             std::string opjPathStr = opjPath.string();
@@ -747,23 +882,44 @@ int main(int argc, char* argv[])
 
             for (unsigned int i = 0; i < opj.excelCount(); i++)
             {
-                 Origin::Excel& book = opj.excel(i);
+                Origin::Excel& book = opj.excel(i);
 
                 std::string fullLabel = book.label.empty() ? book.name : book.label;
 
                 // Origin's Aqualog naming template appends a fixed,
-                // non-sample-specific descriptor after " - " (e.g.
-                // "Sample01 (01) - 3D Acquisition EEM 3D CCD - Absorbance").
-                // Only the part before that separator is the actual sample
-                // identifier; the full, untrimmed label is still kept in
-                // the workbook_name attribute below.
+                // non-sample-specific descriptor after the identifier
+                // (e.g. "AO22020 (01) - 3D Acquisition EEM 3D CCD -
+                // Absorbance"). Only the part through the closing
+                // parenthesis is the actual sample identifier; the full,
+                // untrimmed label is still kept in the workbook_name
+                // attribute below.
                 std::string sampleId = fullLabel;
                 size_t descriptorPos = fullLabel.find(")");
                 if (descriptorPos != std::string::npos)
                     sampleId = fullLabel.substr(0, descriptorPos + 1);
 
+                ValidationResult validation = validateWorkbookAxes(book);
+                if (!validation.ok)
+                {
+                    if (validation.isBlank)
+                    {
+                        std::cout << "  Skipping '" << sampleId
+                                  << "' - no S1Sample sheet; this is a blank, not a sample\n";
+                        skippedBlankCount++;
+                    }
+                    else
+                    {
+                        std::cout << "  Skipping sample: " << sampleId
+                                  << " (failed consistency checks)\n";
+                        skippedInvalidCount++;
+                    }
+                    for (auto& reason : validation.reasons)
+                        std::cerr << "    [skip] " << reason << "\n";
+                    continue;
+                }
+
                 std::string baseName = safeName(sampleId);
-                std::string groupName = uniqueGroupName(nc, baseName);
+                std::string groupName = uniqueGroupName(usedGroupNames, baseName);
 
                 std::cout << "  Exporting sample: " << sampleId;
                 if (groupName != baseName)
@@ -787,7 +943,15 @@ int main(int argc, char* argv[])
             }
         }
 
-        std::cout << "Done\n";
+        if (skippedBlankCount > 0 || skippedInvalidCount > 0)
+        {
+            std::cout << "Done (" << skippedBlankCount << " blank(s) skipped, "
+                      << skippedInvalidCount << " sample(s) failed consistency checks)\n";
+        }
+        else
+        {
+            std::cout << "Done\n";
+        }
     }
     catch (const NcException& e)
     {
