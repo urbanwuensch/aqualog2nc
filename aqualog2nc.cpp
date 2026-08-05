@@ -35,6 +35,15 @@
 // whichever of R1andR1cSample/Blank or AbsSpectrumSample/Blank is found
 // first in that workbook).
 //
+// EEM MATRIX DIMENSION ORDER (MATLAB compatibility)
+// netCDF stores dimensions in C order (first declared = slowest-varying),
+// but MATLAB's ncread() reverses dimension order on read to keep indexing
+// natural for its column-major arrays. writeEemMatrix() declares
+// (excitation, emission) - the reverse of the natural reading order - so
+// that ncread() in MATLAB returns an array shaped (emission, excitation),
+// matching how the Aqualog software displays it. The values array is
+// filled to match: excitation-major (outer), emission-minor (inner).
+//
 // XCORRECT CONSOLIDATION
 // Up to three sheets can each carry a copy of the excitation correction
 // factor (R1andR1cBlank, R1andR1cSample, AbsSpectrumBlank) - these should
@@ -44,6 +53,14 @@
 // source, matching aqualogimport.m's Xout.XCorrect). Mcorrect has only
 // ever had one source, so it's unchanged, still written per-workbook on
 // the emission axis.
+//
+// REDUNDANT ABSORBANCE FIELDS DROPPED
+// AbsSpectrumSample/Blank's R1, R1dark, and "horiba backup" columns were
+// confirmed by manual cross-check against the Aqualog software to be
+// identical to R1_Sample/R1_Blank/R1dark_Sample/R1dark_Blank (already
+// written from the R1andR1c sheets), so writeAbsSpectrum() now only
+// writes AbsI1_Sample/Blank and AbsI1dark_Sample/Blank - the values that
+// are unique to the absorbance sheet.
 //
 // SAMPLE TIMESTAMPS
 // Origin::Excel inherits Window::creationDate / Window::modificationDate
@@ -85,11 +102,15 @@
 // suffix in that case, and every group also gets a source_opj_file
 // attribute so you can always trace a sample back to its origin file.
 // Collision tracking uses an in-memory set of names already used, rather
-// than repeatedly querying the NetCDF file's existing groups - the latter
-// gets slower as the file accumulates more groups (effectively O(n) per
-// lookup), which shows up as a visible per-sample slowdown over a large
-// batch; the in-memory set keeps each lookup O(1) on average regardless
-// of how many samples have already been written.
+// than repeatedly querying the NetCDF file's existing groups.
+//
+// PERFORMANCE OVER LARGE BATCHES (hundreds of samples)
+// nc.set_Fill(NC_NOFILL, ...) disables netCDF's default pre-fill-then-
+// overwrite behavior for new variables. Since every variable here is
+// always fully populated immediately after creation, that pre-fill write
+// is pure redundant I/O in this code's usage pattern. Per-sample elapsed-
+// time logging (via <chrono>) is also printed to stdout for visibility
+// into large-batch runs.
 //
 // ASSUMPTIONS TO VERIFY AGAINST YOUR OriginObj.h / OriginFile.h:
 //   - Origin::Variant has type() returning V_DOUBLE or V_STRING, plus
@@ -118,6 +139,7 @@
 
 #include <algorithm>
 #include <cctype>
+#include <chrono>
 #include <cmath>
 #include <ctime>
 #include <filesystem>
@@ -283,10 +305,8 @@ std::vector<double> gatherValues(Origin::SpreadColumn& col, const std::vector<si
 
 // Appends a numeric suffix if `baseName` is already present in `usedNames`
 // (populated as groups are created). Checking against this in-memory set
-// is O(1) on average regardless of how many samples have already been
-// processed - unlike repeatedly querying the NetCDF file's existing
-// groups, which gets slower as the file grows and was the main cause of a
-// visible per-sample slowdown over large batches.
+// is O(1) on average, unlike repeatedly querying the NetCDF file's
+// existing groups.
 std::string uniqueGroupName(std::unordered_set<std::string>& usedNames, const std::string& baseName)
 {
     if (usedNames.insert(baseName).second)
@@ -528,9 +548,17 @@ SheetKind classifySheet(const std::string& normalizedName)
 // Per-sheet-type writers
 // ---------------------------------------------------------------------
 
-// S1Sample / S1Blank: emission (rows) x excitation (cols) matrix.
+// S1Sample / S1Blank: emission x excitation matrix.
 //   dat = cell2mat(worksheetData(:,2:end));
 //   Xout.S1Sample(j,:,:) = flip(dat,2);   <- reverse column order
+//
+// netCDF stores dimensions in C order (first declared = slowest-varying),
+// but MATLAB's ncread() reverses dimension order on read to keep indexing
+// natural for its column-major arrays. Declaring (excitation, emission)
+// here - the reverse of the natural reading order - means ncread() in
+// MATLAB returns an array shaped (emission, excitation), matching how the
+// Aqualog software displays it. The values array below is filled to match
+// this declared order: excitation-major (outer), emission-minor (inner).
 void writeEemMatrix(NcGroup& group, Origin::SpreadSheet& sheet,
                      const NcDim& emDim, const NcDim& exDim,
                      const std::vector<size_t>& emRows,
@@ -565,13 +593,13 @@ void writeEemMatrix(NcGroup& group, Origin::SpreadSheet& sheet,
         {
             size_t srcRow = emRows[r];
             if (srcRow < col.data.size())
-                values[r * cols + c] = variantToDouble(col.data[srcRow]);
+                values[c * rows + r] = variantToDouble(col.data[srcRow]);
         }
     }
 
-    NcVar intensity = group.addVar(varName, ncDouble, {emDim, exDim});
+    NcVar intensity = group.addVar(varName, ncDouble, {exDim, emDim});
     intensity.putVar(values.data());
-    intensity.putAtt("coordinates", "emission excitation");
+    intensity.putAtt("coordinates", "excitation emission");
 }
 
 // R1andR1cSample / R1andR1cBlank: one row per excitation wavelength.
@@ -624,36 +652,28 @@ void writeEmissionVector(NcGroup& group, Origin::SpreadSheet& sheet,
 }
 
 // AbsSpectrumSample / AbsSpectrumBlank: absorbance vs. wavelength, on the
-// shared "excitation" axis. Column 5 (the other redundant XCorrect source
-// in the Blank sheet) is handled separately by writeXCorrect().
+// shared "excitation" axis. Only AbsI1/AbsI1dark are written - the sheet's
+// R1, R1dark, and "horiba backup" columns were confirmed by manual
+// cross-check to be identical to R1_Sample/R1_Blank/R1dark_Sample/
+// R1dark_Blank (already written from the R1andR1c sheets), so they're
+// intentionally not duplicated here.
 void writeAbsSpectrum(NcGroup& group, Origin::SpreadSheet& sheet,
                        const NcDim& exDim, const std::vector<size_t>& exRows,
                        const std::string& label)
 {
-    if (sheet.columns.size() < 5 || exDim.isNull() || exRows.empty())
+    if (sheet.columns.size() < 3 || exDim.isNull() || exRows.empty())
     {
         std::cerr << "  [warn] sheet '" << sheet.name
                   << "': fewer columns than expected, or missing excitation axis - skipped\n";
         return;
     }
 
-    auto writeVar = [&](const std::string& name, size_t colIndex) {
-        if (colIndex >= sheet.columns.size())
-            return;
-        std::vector<double> v = gatherValues(sheet.columns[colIndex], exRows);
-        NcVar var = group.addVar(name, ncDouble, exDim);
-        var.putVar(v.data());
-    };
+    std::vector<double> v = gatherValues(sheet.columns[1], exRows);
+    NcVar var = group.addVar("AbsI1_" + label, ncDouble, exDim);
+    var.putVar(v.data());
 
-    writeVar("AbsI1_" + label, 1);
-    writeVar("AbsR1_" + label, 3);
     group.putAtt("AbsI1dark_" + label, ncDouble,
                  sheet.columns[2].data.empty() ? kNaN : variantToDouble(sheet.columns[2].data[0]));
-    group.putAtt("AbsR1dark_" + label, ncDouble,
-                 sheet.columns[4].data.empty() ? kNaN : variantToDouble(sheet.columns[4].data[0]));
-
-    if (label == "Sample" && sheet.columns.size() > 9)
-        writeVar("Abs_horiba", 9);
 }
 
 // XCorrect: up to three sheets can each carry a copy of this correction
@@ -864,9 +884,17 @@ int main(int argc, char* argv[])
         nc.putAtt("Conventions", "CF-1.8");
         nc.putAtt("source_input", argv[1]);
 
+        // Every variable in this program is fully populated immediately
+        // after creation, so netCDF's default "pre-fill with a fill value,
+        // then overwrite" behavior is pure redundant I/O here - safe to
+        // disable unconditionally.
+        int oldFillMode;
+        nc.set_Fill(NC_NOFILL, &oldFillMode);
+
         std::unordered_set<std::string> usedGroupNames;
         unsigned int skippedBlankCount = 0;
         unsigned int skippedInvalidCount = 0;
+        //unsigned int sampleIndex = 0;
 
         for (const auto& opjPath : opjFiles)
         {
@@ -882,6 +910,8 @@ int main(int argc, char* argv[])
 
             for (unsigned int i = 0; i < opj.excelCount(); i++)
             {
+                //auto sampleStart = std::chrono::steady_clock::now();
+
                 Origin::Excel& book = opj.excel(i);
 
                 std::string fullLabel = book.label.empty() ? book.name : book.label;
@@ -940,6 +970,12 @@ int main(int argc, char* argv[])
                     group.putAtt("modification_time", modified);
 
                 exportWorkbook(group, book);
+
+                //auto sampleEnd = std::chrono::steady_clock::now();
+                //auto elapsedMs =
+                //    std::chrono::duration_cast<std::chrono::milliseconds>(sampleEnd - sampleStart).count();
+                //sampleIndex++;
+                //std::cout << "    (sample #" << sampleIndex << ", " << elapsedMs << " ms)\n";
             }
         }
 
