@@ -1,7 +1,7 @@
 // aqualog2nc.cpp
 //
 // Exports Aqualog EEM/absorbance data from one .opj file, or every .opj
-// file found (recursively) under a folder, into a single NetCDF file -
+// file found under a folder, into a single NetCDF file -
 // without needing Origin Pro installed.
 //
 // Usage: aqualog2nc <input.opj | input_folder> output.nc
@@ -320,9 +320,9 @@ std::string uniqueGroupName(std::unordered_set<std::string>& usedNames, const st
     }
 }
 
-// Recursively collects every .opj file under `input` (or just `input`
-// itself, if it's already a single .opj file), sorted for a deterministic
-// processing order.
+// Collects every .opj file directly inside `input` (not subfolders) - or
+// just `input` itself, if it's already a single .opj file - sorted for a
+// deterministic processing order.
 std::vector<fs::path> collectOpjFiles(const fs::path& input)
 {
     std::vector<fs::path> files;
@@ -343,7 +343,7 @@ std::vector<fs::path> collectOpjFiles(const fs::path& input)
 
     if (fs::is_directory(input))
     {
-        for (const auto& entry : fs::recursive_directory_iterator(input))
+        for (const auto& entry : fs::directory_iterator(input))
         {
             if (entry.is_regular_file() && isOpj(entry.path()))
                 files.push_back(entry.path());
