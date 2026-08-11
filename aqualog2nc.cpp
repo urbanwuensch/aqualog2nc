@@ -1,12 +1,16 @@
 // aqualog2nc.cpp
 //
-// Exports Aqualog EEM/absorbance data from one .opj file, or every .opj
-// file found under a folder, into a single NetCDF file -
+// Exports Aqualog EEM/absorbance data from one .opj/.ogw file, or every
+// .opj/.ogw file found under a folder, into a single NetCDF file -
 // without needing Origin Pro installed.
 //
-// Usage: aqualog2nc <input.opj | input_folder> output.nc
+// Usage: aqualog2nc <input.opj | input.ogw | input_folder> output.nc
 //
-// Every workbook in every input .opj becomes its own top-level NetCDF
+// Only samples whose Experiment Type is exactly
+// "3D Acquisition[EEM 3D CCD + Absorbance]" are exported (see
+// kRequiredExperimentType below) - everything else is skipped.
+//
+// Every workbook in every input .opj/.ogw becomes its own top-level NetCDF
 // group, each with its own independent emission/excitation axes AND its
 // own XCorrect/MCorrect variables - there is no assumption that different
 // samples share a common wavelength grid or correction factors. This
@@ -143,6 +147,7 @@
 #include <cmath>
 #include <ctime>
 #include <filesystem>
+#include <fstream>
 #include <iomanip>
 #include <iostream>
 #include <limits>
@@ -167,6 +172,12 @@ constexpr double kMaxPhysicalWavelength = 850.0;
 // How far apart two XCorrect sources are allowed to be before we warn
 // about a real disagreement rather than floating-point noise.
 constexpr double kXCorrectTolerance = 1e-6;
+
+// Only samples whose <ExpType> (see extractExpSummaryFields() below) equals
+// this exactly are exported; everything else - including samples where
+// <ExpType> is missing entirely - is skipped. Adjust if you need to export
+// a different Aqualog acquisition mode.
+const std::string kRequiredExperimentType = "3D Acquisition[EEM 3D CCD + Absorbance]";
 
 // ---------------------------------------------------------------------
 // Small helpers
@@ -237,6 +248,563 @@ double variantToDouble(const Origin::Variant& v)
 bool contains(const std::string& s, const std::string& k)
 {
     return s.find(k) != std::string::npos;
+}
+
+// Every Aqualog workbook template includes a page literally named "Note"
+// (see the LTCONST tree in the workbook's raw property block, which lists
+// it alongside S1Sample/AbsSpectrumBlank/etc. as just another numbered
+// page). It is genuinely empty as *stored spreadsheet cell data* on every
+// workbook checked - Aqualog's own "[EXP_FD_FILE] / EXPERIMENT SUMMARY:"
+// note text is not saved there verbatim. Kept as a fallback in case a
+// given file DOES have something an operator actually typed on this page
+// (it would come back as a V_STRING cell); concatenates every non-empty
+// string cell found on the sheet, in column-then-row order.
+// Extracts the text between <tag>...</tag>, or "" if not found.
+std::string extractXmlTag(const std::string& text, const std::string& tag)
+{
+    std::string openTag = "<" + tag + ">";
+    std::string closeTag = "</" + tag + ">";
+    size_t start = text.find(openTag);
+    if (start == std::string::npos)
+        return "";
+    start += openTag.size();
+    size_t end = text.find(closeTag, start);
+    if (end == std::string::npos)
+        return "";
+    return text.substr(start, end - start);
+}
+
+// Aqualog's GENERAL PARAMETERS report gives each sample a "Data
+// Identifier" (e.g. "quninesulfate", "Dana0013", "ppl00") that is NOT part
+// of the <ExpSummary> XML - it comes from the workbook's own long
+// name/label instead. The label's first line is consistently
+// "<DataIdentifier> (<NN>)" followed by a newline and the experiment type/
+// comment text; the "(NN)" is some per-workbook creation-order counter, not
+// part of the identifier. Confirmed against all 5 independently-provided
+// real-world files (dana12/fs17/qsbs/trm_01/trm_02, spanning 3 different
+// physical instruments): the extracted value matched each file's
+// ground-truth "Data Identifier:" exactly (Dana0013, MOS17111,
+// quninesulfate, ppl00, ppl02).
+std::string extractDataIdentifier(const std::string& label)
+{
+    size_t newline = label.find('\n');
+    std::string firstLine = (newline == std::string::npos) ? label : label.substr(0, newline);
+    while (!firstLine.empty() && (firstLine.back() == '\r' || firstLine.back() == ' '))
+        firstLine.pop_back(); // labels use CRLF line endings
+
+    size_t openParen = firstLine.rfind(" (");
+    if (openParen != std::string::npos && !firstLine.empty() && firstLine.back() == ')')
+    {
+        bool digitsOnly = !firstLine.empty();
+        for (size_t i = openParen + 2; i + 1 < firstLine.size(); i++)
+        {
+            if (!isdigit(static_cast<unsigned char>(firstLine[i])))
+            {
+                digitsOnly = false;
+                break;
+            }
+        }
+        if (digitsOnly)
+            firstLine = firstLine.substr(0, openParen);
+    }
+    return firstLine;
+}
+
+// Aqualog stores a small per-workbook <ExpSummary> XML block (inside
+// Window::rawPropertyBlock, which liborigin exposes as the raw tail of the
+// window's property header) with <ExpType>, <IntegrationTime>,
+// <IntegrationTimeUnits>, and <ExpFilename> tags. Confirmed against test.opj
+// and all 5 testdata files: <ExpType> reproduces Aqualog's "Experiment
+// Type:" value exactly, and <ExpFilename> reproduces "Source Acquisition
+// File:". These two fields below are pulled directly from that XML.
+//
+// <IntegrationTime> is NOT used for the integration_time attribute despite
+// also being available here - it stores the raw double with binary
+// floating-point representation error visible (e.g. "0.050000" comes back
+// as "5.0000000000000003e-002"), whereas the compressed report's own
+// "Integration Time: 0.050000" line is Aqualog's own pre-formatted, clean
+// decimal string. See extractIntegrationTimeText() below, which pulls it
+// from there instead.
+//
+// UPDATE - the rest of the report (Park:, Grating:, Detector settings,
+// CFG_NAME=, EX1=/EM1=/S1=/A1=/R1= device assignments, the embedded
+// [EXP_FILE] acquisition XML) turned out to BE persisted after all - not
+// as literal ASCII/UTF-16LE/plain-float bytes (hence the earlier exhaustive
+// search below finding nothing), but compressed with PKWare Data
+// Compression Library's "Implode" scheme. See the "Compressed Note text"
+// section below (decodeCompressedNotes() / pkware::decode()) for the
+// decoder - confirmed byte-exact against a live capture of Origin's own
+// decompressor (see the runbook) - Integration Time, Park wavelength, and
+// the CCD settings are all pulled from it there. CFG_NAME is still not
+// recovered here; it turned out to be a static per-instrument model
+// identifier defined in the bundled Aqualog software's own jySystems.xml,
+// not saved per-project at all, so there's nothing to decode for that one
+// specifically.
+//
+// (Original exhaustive-search note, kept for context: checked against all
+// 5 real-world testdata files, 3 different physical instruments, via
+// literal ASCII search, UTF-16LE search, exact IEEE-754 double search, and
+// exact float32 search for each file's own ground-truth Park value and
+// CFG_NAME string - zero hits in every case, which is what motivated
+// looking at the compressed embedded-page storage in the first place.)
+struct ExpSummaryFields
+{
+    std::string expType;
+    std::string expFilename;
+};
+
+ExpSummaryFields extractExpSummaryFields(const std::string& rawPropertyBlock)
+{
+    ExpSummaryFields fields;
+    fields.expType = extractXmlTag(rawPropertyBlock, "ExpType");
+    fields.expFilename = extractXmlTag(rawPropertyBlock, "ExpFilename");
+    return fields;
+}
+
+// ---------------------------------------------------------------------
+// Compressed Note text (PKWare Data Compression Library "Implode")
+// ---------------------------------------------------------------------
+//
+// Aqualog's full auto-generated "GENERAL PARAMETERS:" report - the part
+// extractExpSummaryFields() above can't reach (Park:, Grating:, detector
+// settings, the embedded [EXP_FILE] acquisition XML) - lives per-workbook
+// in one of several generic "@${[0|<kind>|_Storage_Ebdded_pages_Data_|
+// <size>|<checksum>]}" embedded-page storage records (the same mechanism
+// Origin uses for graph thumbnails), compressed with PKWare's "Implode"
+// scheme (kind 5; the format behind old ZIP method 6 / MPQ archives) once
+// the note is long enough - which every auto-generated report is. See
+// origin_note_decompression_runbook.md and note_decompression_research/ in
+// this repo for the full reverse-engineering writeup.
+//
+// CONFIRMED CORRECT: both the decode() logic below and the escaping
+// scheme in unescapeStorageBytes() were verified byte-for-byte against a
+// live capture of Origin's own decompressor input/output (a Frida hook on
+// OPack9.dll!opkUnCompressBufferToBuffer inside a real Origin process,
+// documented in the runbook's "Session 4" and "Session 6") - all 5 known
+// testdata files now decode the full report text ("GENERAL PARAMETERS:"
+// through "ACCESSORIES:" and beyond) with zero byte errors. That said,
+// this has only been checked against those 5 files; decode() below still
+// stops early (returning whatever came out cleanly so far) if it ever
+// hits a genuinely inconsistent bitstream on a file that turns out to
+// exercise something these 5 didn't, so every caller of this decoded text
+// should still treat a field as "present if found, silently absent
+// otherwise" rather than assuming it's always there.
+//
+// A workbook's own "@${[...]}" record isn't at any fixed position - each
+// workbook's template reserves 20 sample-note "slots" (confirmed: 20 such
+// records per workbook in every file checked, almost all empty), so
+// instead of guessing a slot, decodeCompressedNotes() decodes every kind-5
+// record in the file and each one is matched back to a workbook by its own
+// "Data Identifier: " line (which - being near the top of the report -
+// decodes reliably even when Park and later fields don't), rather than
+// assuming any particular file position.
+namespace pkware
+{
+
+constexpr int kMaxBits = 13;
+
+struct HuffmanTable
+{
+    std::vector<short> count;   // number of codes of each bit length
+    std::vector<short> symbol;  // symbols in canonical order
+};
+
+// `rep` packs a run-length-encoded list of Huffman code lengths: each byte
+// is (repeat_count - 1) in the high nibble, bit length in the low nibble.
+// Mirrors construct() in Mark Adler's public-domain "blast.c" reference
+// PKWare-Implode decompressor (zlib/libpng license; see
+// note_decompression_research/blast/blast.c in this repo for the
+// original), which this whole pkware:: namespace is adapted from.
+HuffmanTable buildHuffmanTable(const unsigned char* rep, size_t n)
+{
+    std::vector<unsigned char> length;
+    for (size_t i = 0; i < n; i++)
+    {
+        unsigned char len = rep[i] & 0x0F;
+        unsigned char repeat = (rep[i] >> 4) + 1;
+        for (unsigned char r = 0; r < repeat; r++)
+            length.push_back(len);
+    }
+
+    HuffmanTable table;
+    table.count.assign(kMaxBits + 1, 0);
+    for (unsigned char len : length)
+        table.count[len]++;
+
+    std::vector<short> offs(kMaxBits + 2, 0);
+    for (int len = 1; len <= kMaxBits; len++)
+        offs[len + 1] = static_cast<short>(offs[len] + table.count[len]);
+
+    table.symbol.assign(length.size(), 0);
+    std::vector<short> next = offs;
+    for (size_t sym = 0; sym < length.size(); sym++)
+    {
+        if (length[sym] != 0)
+            table.symbol[next[length[sym]]++] = static_cast<short>(sym);
+    }
+    return table;
+}
+
+// PKWare Implode packs bits into bytes least-significant-bit first.
+class BitReader
+{
+public:
+    explicit BitReader(const std::string& data) : data_(data) {}
+
+    int bit()  // -1 once input is exhausted
+    {
+        size_t byteIndex = pos_ / 8;
+        if (byteIndex >= data_.size())
+            return -1;
+        int b = (static_cast<unsigned char>(data_[byteIndex]) >> (pos_ % 8)) & 1;
+        pos_++;
+        return b;
+    }
+
+    int bits(int need)  // -1 if it runs out of input partway through
+    {
+        int value = 0;
+        for (int i = 0; i < need; i++)
+        {
+            int b = bit();
+            if (b < 0)
+                return -1;
+            value |= b << i;
+        }
+        return value;
+    }
+
+private:
+    const std::string& data_;
+    size_t pos_ = 0;
+};
+
+// -1 on exhausted input or an incomplete/invalid code.
+int decodeSymbol(BitReader& reader, const HuffmanTable& table)
+{
+    int code = 0, first = 0, index = 0, len = 1;
+    while (len <= kMaxBits)
+    {
+        int b = reader.bit();
+        if (b < 0)
+            return -1;
+        code |= (b ^ 1);
+        int count = table.count[len];
+        if (code < first + count)
+            return table.symbol[index + (code - first)];
+        index += count;
+        first += count;
+        first <<= 1;
+        code <<= 1;
+        len++;
+    }
+    return -1;
+}
+
+// Bit-length tables for the three canonical PKWare Implode Huffman trees
+// (literals, match lengths, match distances) - fixed/static, not stored
+// per file, which is why different files' compressed notes can share
+// identical compressed byte runs at template-identical content.
+const unsigned char kLiteralLengths[] = {
+    11, 124, 8, 7, 28, 7, 188, 13, 76, 4, 10, 8, 12, 10, 12, 10, 8, 23, 8,
+    9, 7, 6, 7, 8, 7, 6, 55, 8, 23, 24, 12, 11, 7, 9, 11, 12, 6, 7, 22, 5,
+    7, 24, 6, 11, 9, 6, 7, 22, 7, 11, 38, 7, 9, 8, 25, 11, 8, 11, 9, 12,
+    8, 12, 5, 38, 5, 38, 5, 11, 7, 5, 6, 21, 6, 10, 53, 8, 7, 24, 10, 27,
+    44, 253, 253, 253, 252, 252, 252, 13, 12, 45, 12, 45, 12, 61, 12, 45,
+    44, 173};
+const unsigned char kLengthLengths[] = {2, 35, 36, 53, 38, 23};
+const unsigned char kDistanceLengths[] = {2, 20, 53, 230, 247, 151, 248};
+const short kLengthBase[16] = {3, 2, 4, 5, 6, 7, 8, 9, 10, 12, 16, 24, 40, 72, 136, 264};
+const char kLengthExtraBits[16] = {0, 0, 0, 0, 0, 0, 0, 0, 1, 2, 3, 4, 5, 6, 7, 8};
+
+// Decodes a PKWare Implode stream, stopping (and returning whatever came
+// out so far) at the first sign of an inconsistent bitstream. See the big
+// comment above this namespace for what "best-effort" means here.
+std::string decode(const std::string& compressed)
+{
+    if (compressed.size() < 2)
+        return "";
+
+    BitReader reader(compressed);
+    int literalsCoded = reader.bits(8);
+    int dictBits = reader.bits(8);
+    if (literalsCoded < 0 || literalsCoded > 1 || dictBits < 4 || dictBits > 6)
+        return "";
+
+    HuffmanTable litTable = buildHuffmanTable(kLiteralLengths, sizeof(kLiteralLengths));
+    HuffmanTable lenTable = buildHuffmanTable(kLengthLengths, sizeof(kLengthLengths));
+    HuffmanTable distTable = buildHuffmanTable(kDistanceLengths, sizeof(kDistanceLengths));
+
+    std::string out;
+    out.reserve(compressed.size() * 6);  // typical ratio seen on this data
+
+    while (true)
+    {
+        int flag = reader.bit();
+        if (flag < 0)
+            break;
+
+        if (flag == 0)
+        {
+            int symbol = literalsCoded ? decodeSymbol(reader, litTable) : reader.bits(8);
+            if (symbol < 0)
+                break;
+            out += static_cast<char>(symbol);
+            continue;
+        }
+
+        int lenSymbol = decodeSymbol(reader, lenTable);
+        if (lenSymbol < 0)
+            break;
+        int extraLen = reader.bits(kLengthExtraBits[lenSymbol]);
+        if (extraLen < 0)
+            break;
+        int length = kLengthBase[lenSymbol] + extraLen;
+        if (length == 519)
+            break;  // end-of-stream marker
+
+        int distBits = (length == 2) ? 2 : dictBits;
+        int distSymbol = decodeSymbol(reader, distTable);
+        if (distSymbol < 0)
+            break;
+        int extraDist = reader.bits(distBits);
+        if (extraDist < 0)
+            break;
+        int distance = (distSymbol << distBits) + extraDist + 1;
+
+        if (static_cast<size_t>(distance) > out.size())
+            break;  // impossible back-reference - bitstream has desynced from here on
+
+        size_t from = out.size() - static_cast<size_t>(distance);
+        for (int i = 0; i < length; i++)
+            out += out[from + static_cast<size_t>(i)];
+    }
+
+    return out;
+}
+
+}  // namespace pkware
+
+// Undoes the backslash-escaping every "@${[...]}" embedded-page payload is
+// wrapped in (so it can live inside what's otherwise a null-terminated-
+// string-oriented container): bytes < 0x20 are written as a backslash
+// followed by a single base-32 digit ('0'-'9' then 'A'-'V' for 10-31).
+// Confirmed on compressed (kind-5) payloads specifically, this needs two
+// more rules beyond that base scheme: "\\" (a literal backslash following
+// the escape backslash) decodes to one literal 0x5C byte, and "\Z" decodes
+// to 0xFF. Both confirmed byte-exact against a live capture of Origin's
+// own decompressor input (see the runbook) - all 5 testdata files decode
+// the full report text with zero byte errors using this scheme.
+std::string unescapeStorageBytes(const std::string& raw)
+{
+    std::string out;
+    out.reserve(raw.size());
+    for (size_t i = 0; i < raw.size();)
+    {
+        unsigned char b = static_cast<unsigned char>(raw[i]);
+        if (b == 0x5C && i + 1 < raw.size())
+        {
+            unsigned char c = static_cast<unsigned char>(raw[i + 1]);
+            if (c >= '0' && c <= '9')
+            {
+                out += static_cast<char>(c - '0');
+                i += 2;
+                continue;
+            }
+            if (c >= 'A' && c <= 'V')
+            {
+                out += static_cast<char>(c - 'A' + 10);
+                i += 2;
+                continue;
+            }
+            if (c == '\\')
+            {
+                out += '\\';
+                i += 2;
+                continue;
+            }
+            if (c == 'Z')
+            {
+                out += static_cast<char>(0xFF);
+                i += 2;
+                continue;
+            }
+        }
+        out += static_cast<char>(b);
+        i += 1;
+    }
+    return out;
+}
+
+// Manual (non-regex, matching this file's style) parse for "Data
+// Identifier: <value>" within a decoded note - the value runs to end of
+// line. Used to match a decoded compressed note back to the workbook it
+// belongs to (see decodeCompressedNotes() below).
+std::string extractDataIdentifierFromDecodedNote(const std::string& decoded)
+{
+    const std::string marker = "Data Identifier: ";
+    size_t pos = decoded.find(marker);
+    if (pos == std::string::npos)
+        return "";
+    pos += marker.size();
+    size_t end = decoded.find_first_of("\r\n", pos);
+    return decoded.substr(pos, end == std::string::npos ? std::string::npos : end - pos);
+}
+
+// Manual parse for "Park: <number>nm". Returns "" if not found, or if the
+// text right after "Park: " isn't cleanly digits/'.' immediately followed
+// by "nm" - which in practice is exactly what happens once the decoded
+// text has run into the not-yet-resolved corruption described above, so
+// this doubles as the "did decode actually make it this far intact" check.
+std::string extractParkWavelengthText(const std::string& decoded)
+{
+    const std::string marker = "Park: ";
+    size_t pos = decoded.find(marker);
+    if (pos == std::string::npos)
+        return "";
+    pos += marker.size();
+    size_t end = pos;
+    while (end < decoded.size() &&
+           (std::isdigit(static_cast<unsigned char>(decoded[end])) || decoded[end] == '.'))
+        end++;
+    if (end == pos || decoded.compare(end, 2, "nm") != 0)
+        return "";
+    return decoded.substr(pos, end - pos);
+}
+
+// Manual parse for "XBin:<digits>" (no space after the colon here, unlike
+// the other fields - matches Aqualog's literal formatting). "" if not
+// found or the digit run is empty.
+std::string extractXBinText(const std::string& decoded)
+{
+    const std::string marker = "XBin:";
+    size_t pos = decoded.find(marker);
+    if (pos == std::string::npos)
+        return "";
+    pos += marker.size();
+    size_t end = pos;
+    while (end < decoded.size() && std::isdigit(static_cast<unsigned char>(decoded[end])))
+        end++;
+    if (end == pos)
+        return "";
+    return decoded.substr(pos, end - pos);
+}
+
+// Manual parse for "Integration Time: <seconds>" - the report's own
+// pre-formatted decimal string, used instead of the <IntegrationTime> XML
+// tag (see the big comment above ExpSummaryFields) because this one
+// doesn't have binary floating-point representation noise. "" if not
+// found, or if the text right after the marker isn't cleanly digits/'.'
+// running straight to end of line - same "did decode survive to here"
+// check as extractParkWavelengthText() above.
+std::string extractIntegrationTimeText(const std::string& decoded)
+{
+    const std::string marker = "Integration Time: ";
+    size_t pos = decoded.find(marker);
+    if (pos == std::string::npos)
+        return "";
+    pos += marker.size();
+    size_t end = pos;
+    while (end < decoded.size() &&
+           (std::isdigit(static_cast<unsigned char>(decoded[end])) || decoded[end] == '.'))
+        end++;
+    if (end == pos || (end < decoded.size() && decoded[end] != '\r' && decoded[end] != '\n'))
+        return "";
+    return decoded.substr(pos, end - pos);
+}
+
+// Manual parse for the rest of the line after `marker` - used for "ADC: "
+// and "Gain: ", which are freeform descriptive text (e.g. "500 kHz G",
+// "ADC Gain / 1.00") rather than a clean number, so unlike Park/XBin these
+// are kept as strings. Rejects (returns "") if the line contains anything
+// outside printable ASCII/CR/LF/TAB - decode() already stops at a hard
+// bitstream failure, but text can still come out garbled-yet-printable
+// before that point (see the big comment above the pkware:: namespace),
+// and a stray non-printable byte is a cheap, reliable tell that this
+// particular line was pulled from the garbled part.
+std::string extractLineAfterMarker(const std::string& decoded, const std::string& marker)
+{
+    size_t pos = decoded.find(marker);
+    if (pos == std::string::npos)
+        return "";
+    pos += marker.size();
+    size_t end = decoded.find_first_of("\r\n", pos);
+    std::string value = decoded.substr(pos, end == std::string::npos ? std::string::npos : end - pos);
+    for (unsigned char c : value)
+    {
+        if (c != '\t' && (c < 0x20 || c > 0x7E))
+            return "";
+    }
+    return value;
+}
+
+struct CompressedNoteCandidate
+{
+    std::string dataIdentifier;  // "" if not found (decode failed too early, or this slot is empty)
+    std::string decodedText;
+};
+
+// Scans the raw file bytes for every compressed ("kind 5")
+// "_Storage_Ebdded_pages_Data_" record and best-effort decodes each one.
+// One file can (and typically does) hold many of these - one per
+// workbook-template sample-note slot, most of them empty leftovers from
+// other samples that reused the same template - so the caller matches the
+// result back to a specific workbook by comparing CompressedNoteCandidate::
+// dataIdentifier against that workbook's own (already-reliable, XML-based)
+// data identifier, rather than assuming a fixed position.
+std::vector<CompressedNoteCandidate> decodeCompressedNotes(const std::string& fileBytes)
+{
+    std::vector<CompressedNoteCandidate> candidates;
+
+    const std::string marker = "@${[0|5|_Storage_Ebdded_pages_Data_|";
+    size_t pos = 0;
+    while ((pos = fileBytes.find(marker, pos)) != std::string::npos)
+    {
+        size_t fieldsEnd = fileBytes.find("]}", pos);
+        if (fieldsEnd == std::string::npos)
+            break;
+
+        std::string sizeField = fileBytes.substr(pos + marker.size(), fieldsEnd - (pos + marker.size()));
+        size_t bar = sizeField.find('|');
+        unsigned long size = 0;
+        try
+        {
+            size = std::stoul(bar == std::string::npos ? sizeField : sizeField.substr(0, bar));
+        }
+        catch (const std::exception&)
+        {
+            pos = fieldsEnd + 2;
+            continue;
+        }
+
+        size_t payloadStart = fieldsEnd + 2;
+        if (payloadStart + size > fileBytes.size())
+            break;
+
+        std::string decoded = pkware::decode(unescapeStorageBytes(fileBytes.substr(payloadStart, size)));
+
+        CompressedNoteCandidate candidate;
+        candidate.dataIdentifier = extractDataIdentifierFromDecodedNote(decoded);
+        candidate.decodedText = std::move(decoded);
+        candidates.push_back(std::move(candidate));
+
+        pos = payloadStart + size;
+    }
+
+    return candidates;
+}
+
+// Reads a whole file into memory (used to scan for compressed-note storage
+// records directly in the raw bytes, alongside liborigin's own parse of
+// the same file).
+std::string readRawFileBytes(const std::string& path)
+{
+    std::ifstream f(path, std::ios::binary);
+    if (!f)
+        return "";
+    std::ostringstream ss;
+    ss << f.rdbuf();
+    return ss.str();
 }
 
 // Formats a time_t as an ISO-8601 UTC string, e.g. "2024-03-14T09:41:02Z".
@@ -320,23 +888,38 @@ std::string uniqueGroupName(std::unordered_set<std::string>& usedNames, const st
     }
 }
 
-// Collects every .opj file directly inside `input` (not subfolders) - or
-// just `input` itself, if it's already a single .opj file - sorted for a
-// deterministic processing order.
+// Lower-cased file extension, e.g. ".opj" or ".ogw".
+std::string lowerExtension(const fs::path& p)
+{
+    std::string ext = p.extension().string();
+    std::transform(ext.begin(), ext.end(), ext.begin(),
+                    [](unsigned char c) { return std::tolower(c); });
+    return ext;
+}
+
+// Collects every .opj/.ogw file directly inside `input` (not subfolders) -
+// or just `input` itself, if it's already a single .opj/.ogw file - sorted
+// for a deterministic processing order.
+//
+// .opj (a full project) and .ogw (a single workbook) are both written using
+// the same classic Origin binary container - liborigin's parser doesn't
+// look at the file extension at all, it just reads the magic version
+// header directly (see OriginFile's constructor), so a .ogw parses through
+// exactly the same OriginFile/OriginAnyParser path as a .opj containing one
+// workbook. This function is the only place aqualog2nc itself filters by
+// extension, so that's the only thing that needed to change to accept .ogw.
 std::vector<fs::path> collectOpjFiles(const fs::path& input)
 {
     std::vector<fs::path> files;
 
-    auto isOpj = [](const fs::path& p) {
-        std::string ext = p.extension().string();
-        std::transform(ext.begin(), ext.end(), ext.begin(),
-                        [](unsigned char c) { return std::tolower(c); });
-        return ext == ".opj";
+    auto isSupported = [](const fs::path& p) {
+        std::string ext = lowerExtension(p);
+        return ext == ".opj" || ext == ".ogw";
     };
 
     if (fs::is_regular_file(input))
     {
-        if (isOpj(input))
+        if (isSupported(input))
             files.push_back(input);
         return files;
     }
@@ -345,7 +928,7 @@ std::vector<fs::path> collectOpjFiles(const fs::path& input)
     {
         for (const auto& entry : fs::directory_iterator(input))
         {
-            if (entry.is_regular_file() && isOpj(entry.path()))
+            if (entry.is_regular_file() && isSupported(entry.path()))
                 files.push_back(entry.path());
         }
         std::sort(files.begin(), files.end());
@@ -863,7 +1446,7 @@ int main(int argc, char* argv[])
 {
     if (argc < 3)
     {
-        std::cout << "Usage: aqualog2nc <input.opj | input_folder> output.nc\n";
+        std::cout << "Usage: aqualog2nc <input.opj | input.ogw | input_folder> output.nc\n";
         return 1;
     }
 
@@ -872,11 +1455,11 @@ int main(int argc, char* argv[])
 
     if (opjFiles.empty())
     {
-        std::cerr << "No .opj files found at '" << argv[1] << "'\n";
+        std::cerr << "No .opj/.ogw files found at '" << argv[1] << "'\n";
         return 1;
     }
 
-    std::cout << "Found " << opjFiles.size() << " .opj file(s)\n";
+    std::cout << "Found " << opjFiles.size() << " .opj/.ogw file(s)\n";
 
     try
     {
@@ -894,12 +1477,19 @@ int main(int argc, char* argv[])
         std::unordered_set<std::string> usedGroupNames;
         unsigned int skippedBlankCount = 0;
         unsigned int skippedInvalidCount = 0;
+        unsigned int skippedWrongTypeCount = 0;
         //unsigned int sampleIndex = 0;
 
         for (const auto& opjPath : opjFiles)
         {
             std::string opjPathStr = opjPath.string();
-            std::cout << "Reading " << opjPathStr << "\n";
+            // .ogw holds exactly one workbook, so the "Exporting sample: "
+            // line below already identifies it - an extra "Reading ..."
+            // line ahead of it is just noise when there are many .ogw
+            // files (one per sample) rather than a handful of multi-sample
+            // .opj projects.
+            if (lowerExtension(opjPath) != ".ogw")
+                std::cout << "Reading " << opjPathStr << "\n";
 
             OriginFile opj(opjPathStr);
             if (!opj.parse())
@@ -907,6 +1497,26 @@ int main(int argc, char* argv[])
                 std::cerr << "  [error] could not parse '" << opjPathStr << "' - skipped\n";
                 continue;
             }
+
+            // Any standalone Note windows sitting in the project tree
+            // outside a workbook (opj.noteCount()/opj.note()) - e.g. a
+            // scratch note an operator left at the project level rather than
+            // on a specific sample's own Note page. Attached to every
+            // sample group from this file, since there's no single "right"
+            // group to put project-level text on.
+            std::vector<std::string> standaloneNotes;
+            for (unsigned int n = 0; n < opj.noteCount(); n++)
+            {
+                Origin::Note& note = opj.note(n);
+                if (!note.text.empty())
+                    standaloneNotes.push_back(note.name + ": " + note.text);
+            }
+
+            // Decoded once per file (not per workbook) and matched to a
+            // workbook below by data identifier - see decodeCompressedNotes()
+            // above for why a fixed position can't be assumed.
+            std::vector<CompressedNoteCandidate> compressedNotes =
+                decodeCompressedNotes(readRawFileBytes(opjPathStr));
 
             for (unsigned int i = 0; i < opj.excelCount(); i++)
             {
@@ -927,6 +1537,16 @@ int main(int argc, char* argv[])
                 size_t descriptorPos = fullLabel.find(")");
                 if (descriptorPos != std::string::npos)
                     sampleId = fullLabel.substr(0, descriptorPos + 1);
+
+                ExpSummaryFields expSummary = extractExpSummaryFields(book.rawPropertyBlock);
+                if (expSummary.expType != kRequiredExperimentType)
+                {
+                    std::cout << "  Skipping '" << sampleId << "' - Experiment Type is '"
+                              << (expSummary.expType.empty() ? "(none found)" : expSummary.expType)
+                              << "', not '" << kRequiredExperimentType << "'\n";
+                    skippedWrongTypeCount++;
+                    continue;
+                }
 
                 ValidationResult validation = validateWorkbookAxes(book);
                 if (!validation.ok)
@@ -961,6 +1581,77 @@ int main(int argc, char* argv[])
                 group.putAtt("workbook_short_name", book.name);
                 group.putAtt("source_opj_file", opjPathStr);
 
+                std::string dataIdentifier = extractDataIdentifier(fullLabel);
+                if (!dataIdentifier.empty())
+                    group.putAtt("data_identifier", dataIdentifier);
+
+                // Fields pulled from the compressed "GENERAL PARAMETERS:"
+                // report - integration time, Park wavelength (EM1's fixed
+                // park position), the CCD's X binning factor, ADC readout
+                // rate, and gain - each written only if the matching
+                // compressed note decoded far enough to reach it intact;
+                // see the "Compressed Note text" section above. As of the
+                // escape-scheme fix confirmed against a live Origin
+                // capture (see the runbook), all 5 known testdata files
+                // decode the full report cleanly, so in practice all five
+                // attributes should be present together or not at all -
+                // but still written independently/defensively in case a
+                // file not yet seen exercises something these didn't.
+                if (!dataIdentifier.empty())
+                {
+                    for (const auto& candidate : compressedNotes)
+                    {
+                        if (candidate.dataIdentifier != dataIdentifier)
+                            continue;
+
+                        std::string integrationTimeText = extractIntegrationTimeText(candidate.decodedText);
+                        if (!integrationTimeText.empty())
+                        {
+                            try
+                            {
+                                group.putAtt("integration_time", ncDouble, std::stod(integrationTimeText));
+                            }
+                            catch (const std::exception&)
+                            {
+                            }
+                        }
+
+                        std::string parkText = extractParkWavelengthText(candidate.decodedText);
+                        if (!parkText.empty())
+                        {
+                            try
+                            {
+                                group.putAtt("park_wavelength_nm", ncDouble, std::stod(parkText));
+                            }
+                            catch (const std::exception&)
+                            {
+                            }
+                        }
+
+                        std::string xBinText = extractXBinText(candidate.decodedText);
+                        if (!xBinText.empty())
+                        {
+                            try
+                            {
+                                group.putAtt("ccd_xbin", ncInt, std::stoi(xBinText));
+                            }
+                            catch (const std::exception&)
+                            {
+                            }
+                        }
+
+                        std::string adcText = extractLineAfterMarker(candidate.decodedText, "ADC: ");
+                        if (!adcText.empty())
+                            group.putAtt("ccd_adc_readout", adcText);
+
+                        std::string gainText = extractLineAfterMarker(candidate.decodedText, "Gain: ");
+                        if (!gainText.empty())
+                            group.putAtt("ccd_gain", gainText);
+
+                        break;
+                    }
+                }
+
                 std::string created = formatTimestampUtc(book.creationDate);
                 if (!created.empty())
                     group.putAtt("creation_time", created);
@@ -968,6 +1659,19 @@ int main(int argc, char* argv[])
                 std::string modified = formatTimestampUtc(book.modificationDate);
                 if (!modified.empty())
                     group.putAtt("modification_time", modified);
+
+                // expSummary.expType was already used above to filter this
+                // sample in; expFilename is the other <ExpSummary> field
+                // worth keeping as its own typed attribute (see
+                // extractExpSummaryFields() above) - integration_time used
+                // to come from here too, but now comes from the compressed
+                // report instead (see the block above), which doesn't have
+                // this XML tag's floating-point representation noise.
+                if (!expSummary.expFilename.empty())
+                    group.putAtt("experiment_file", expSummary.expFilename);
+
+                for (size_t n = 0; n < standaloneNotes.size(); n++)
+                    group.putAtt("project_note_" + std::to_string(n), standaloneNotes[n]);
 
                 exportWorkbook(group, book);
 
@@ -979,10 +1683,11 @@ int main(int argc, char* argv[])
             }
         }
 
-        if (skippedBlankCount > 0 || skippedInvalidCount > 0)
+        if (skippedBlankCount > 0 || skippedInvalidCount > 0 || skippedWrongTypeCount > 0)
         {
             std::cout << "Done (" << skippedBlankCount << " blank(s) skipped, "
-                      << skippedInvalidCount << " sample(s) failed consistency checks)\n";
+                      << skippedInvalidCount << " sample(s) failed consistency checks, "
+                      << skippedWrongTypeCount << " sample(s) skipped for wrong Experiment Type)\n";
         }
         else
         {
