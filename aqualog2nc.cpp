@@ -738,6 +738,46 @@ std::string extractLineAfterMarker(const std::string& decoded, const std::string
     return value;
 }
 
+// Mirrors a MATLAB analysis script's CCD_gain lookup table: on this
+// instrument, the physical ADC gain multiplier isn't given cleanly by
+// either the "ADC: " or "Gain: " line alone - it's determined by their
+// specific combination. `adcText`/`gainText` are the values already
+// extracted via extractLineAfterMarker() above (without the "ADC: "/
+// "Gain: " prefix). The numeric part of "Gain: ADC Gain / X.XX" is
+// rounded to the nearest integer before matching (the MATLAB source
+// required an exact "1.00"/"2.00" string match; rounding instead means a
+// reading like "2.01" is still treated as the "2" case rather than falling
+// through to unrecognized). Returns NaN for any combination that still
+// doesn't match after rounding - callers should only treat that as a real
+// "unrecognized combination" result, not "decode failed", by checking
+// adcText/gainText are both non-empty first.
+double ccdGainFactorFromReport(const std::string& adcText, const std::string& gainText)
+{
+    const std::string marker = "ADC Gain / ";
+    size_t pos = gainText.find(marker);
+    if (pos == std::string::npos)
+        return kNaN;
+
+    double gainValue;
+    try
+    {
+        gainValue = std::stod(gainText.substr(pos + marker.size()));
+    }
+    catch (const std::exception&)
+    {
+        return kNaN;
+    }
+    long roundedGain = std::lround(gainValue);
+
+    if (adcText == "500 kHz R" && roundedGain == 1)
+        return 1.0;
+    if (adcText == "500 kHz G" && roundedGain == 1)
+        return 2.0;
+    if (adcText == "500 kHz G" && roundedGain == 2)
+        return 4.0;
+    return kNaN;
+}
+
 struct CompressedNoteCandidate
 {
     std::string dataIdentifier;  // "" if not found (decode failed too early, or this slot is empty)
@@ -1647,6 +1687,9 @@ int main(int argc, char* argv[])
                         std::string gainText = extractLineAfterMarker(candidate.decodedText, "Gain: ");
                         if (!gainText.empty())
                             group.putAtt("ccd_gain", gainText);
+
+                        if (!adcText.empty() && !gainText.empty())
+                            group.putAtt("ccd_gain_factor", ncDouble, ccdGainFactorFromReport(adcText, gainText));
 
                         break;
                     }
