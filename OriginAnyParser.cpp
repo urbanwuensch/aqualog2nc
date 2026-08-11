@@ -853,6 +853,14 @@ bool OriginAnyParser::readNoteElement()
                   nwc_start, nwe_contents.c_str())
     }
 
+    // go to end of contents (mirrors the header/label skip-past-separator
+    // pattern above - this was previously missing, which left the file
+    // position misaligned by one byte and caused the note-window list to
+    // stop after just the first entry)
+    file.seekg(nwc_start + nwe_contents_size, ios_base::beg);
+    if (nwe_contents_size > 0)
+        file.seekg(1, ios_base::cur);
+
     // get note window info
     getNoteProperties(nwe_header, nwe_header_size, nwe_label, nwe_label_size, nwe_contents,
                       nwe_contents_size);
@@ -1274,7 +1282,7 @@ bool OriginAnyParser::getColumnInfoAndData(const string &col_header, unsigned in
                     spreadSheets[spread].columns[(current_col - 1)].data.push_back(value);
                 } else // text
                 {
-                    string svaltmp = col_data.substr(i * valuesize + 2, valuesize - 2);
+                    string svaltmp = col_data.substr(i * valuesize + 2, valuesize - 2).c_str();
                     // TODO: check if this test is still needed
                     if (svaltmp.find(0x0E)
                         != string::npos) { // try find non-printable symbol - garbage test
@@ -1474,6 +1482,11 @@ void OriginAnyParser::getWindowProperties(Origin::Window &window, const string &
     }
 
     if (wde_header_size > 0xC3) {
+        // rawPropertyBlock keeps the full, untruncated tail (everything from
+        // offset 0xC3 onward) so callers can pull embedded metadata out of it
+        // (e.g. aqualog2nc's extractXmlTag()); window.label below is the
+        // truncated, human-readable form Origin actually displays.
+        window.rawPropertyBlock = wde_header.substr(0xC3);
         window.label = wde_header.substr(0xC3).c_str();
         window.label = window.label.substr(0, window.label.find("@${"));
         LOG_PRINT(logfile, "			WINDOW %u LABEL: %s\n", objectIndex,
