@@ -237,6 +237,7 @@ struct Window
 
     std::string name;
     std::string label;
+    std::string rawPropertyBlock;
     int objectID;
     bool hidden;
     State state;
