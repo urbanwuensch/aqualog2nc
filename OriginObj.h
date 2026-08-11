@@ -237,11 +237,11 @@ struct Window
 
     std::string name;
     std::string label;
-    std::string rawPropertyBlock;
     int objectID;
     bool hidden;
     State state;
     Title title;
+    std::string rawPropertyBlock;
     Rect frameRect;
     time_t creationDate;
     time_t modificationDate;
