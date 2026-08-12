@@ -10,17 +10,43 @@
 // "3D Acquisition[EEM 3D CCD + Absorbance]" are exported (see
 // kRequiredExperimentType below) - everything else is skipped.
 //
-// Every workbook in every input .opj/.ogw becomes its own top-level NetCDF
-// group, each with its own independent emission/excitation axes AND its
-// own XCorrect/MCorrect variables - there is no assumption that different
-// samples share a common wavelength grid or correction factors. This
-// means a folder can safely accumulate samples measured with different
-// settings (even by accident) without corrupting each other.
+// Runs in three phases (see "SAMPLE-INDEXED SCHEMA" below): every sample
+// from every input file is extracted into memory first, then samples are
+// grouped by exact measurement signature (excitation/emission/XCorrect/
+// MCorrect/park_wavelength_nm/ccd_gain_factor/ccd_xbin/ccd_adc_readout/
+// ccd_gain), then each group is written. A sample's own spectral data and
+// what used to be its own per-sample scalar attributes are now variables
+// indexed by a "data_identifier" dimension shared with everything else in
+// its group - see SampleRecord and writeBucket() below.
 //
 // Dispatches on worksheet *type* instead of treating every sheet as a
 // generic 2D matrix - mirrors the switch(sheetnames{k}) structure in
-// aqualogimport.m. See the comments on each write* function for the
+// aqualogimport.m. See the comments on each extract* function for the
 // specific MATLAB lines they correspond to.
+//
+// SAMPLE-INDEXED SCHEMA
+// Samples that share the exact same excitation axis, emission axis,
+// XCorrect, MCorrect, park_wavelength_nm, ccd_gain_factor, ccd_xbin,
+// ccd_adc_readout, and ccd_gain (compared value-for-value, not just axis
+// length - see measurementSignatureKey()) are collected into one "bucket"
+// and write those shared axes/corrections exactly once, rather than once
+// per sample. Any difference in any of these fields means two samples
+// don't genuinely share one measurement configuration, so they end up in
+// different buckets/groups even if their excitation/emission axes match.
+// If every sample in the input shares one measurement signature, the
+// whole file has a single bucket and no NetCDF groups at all - dimensions
+// and variables sit directly at the top level. If the input spans more
+// than one signature, each gets its own NcGroup, named "measurement_type_N"
+// (zero-padded to a consistent width), largest group first. Either way,
+// within a bucket's scope every
+// per-sample quantity - both the spectral arrays (S1Sample, R1_Blank, ...)
+// and what used to be scalar attributes (integration_time, R1dark_Sample,
+// data_identifier, ...) - is a variable indexed by a "data_identifier"
+// dimension, not an attribute. data_identifier doubles as that
+// dimension's own coordinate variable, the same way excitation/emission
+// are for theirs. See SampleRecord (one per exported sample, holds
+// everything before it's bucketed) and writeBucket() (writes one bucket's
+// worth of variables, one indexed slice per sample).
 //
 // PADDED-ROW HANDLING
 // Origin sometimes reserves more rows in a spreadsheet column than an
@@ -39,53 +65,90 @@
 // whichever of R1andR1cSample/Blank or AbsSpectrumSample/Blank is found
 // first in that workbook).
 //
-// EEM MATRIX DIMENSION ORDER (MATLAB compatibility)
+// PER-SAMPLE VARIABLE DIMENSION ORDER (MATLAB compatibility)
 // netCDF stores dimensions in C order (first declared = slowest-varying),
-// but MATLAB's ncread() reverses dimension order on read to keep indexing
-// natural for its column-major arrays. writeEemMatrix() declares
-// (excitation, emission) - the reverse of the natural reading order - so
-// that ncread() in MATLAB returns an array shaped (emission, excitation),
-// matching how the Aqualog software displays it. The values array is
-// filled to match: excitation-major (outer), emission-minor (inner).
+// but MATLAB's ncread()/netcdf.getVar() reverse dimension order on read to
+// keep indexing natural for its column-major arrays. Every per-sample
+// variable in writeBucket() - S1Sample/S1Blank (3D) and the 2D ones
+// (R1_Sample/R1_Blank/AbsI1_Sample/AbsI1_Blank/S1Dark_Sample/
+// S1Dark_Blank) - is therefore declared with "sample" LAST, not first
+// (e.g. (excitation, emission, sample), not (sample, excitation,
+// emission)), so that reading it back in MATLAB returns sample FIRST
+// (e.g. (sample, emission, excitation)), consistent across every
+// sample-indexed variable in this schema. Each record's own values are
+// filled by extractEemMatrix() to
+// match: excitation-major (outer), emission-minor (inner) - the (sample)
+// index is added later, when writeBucket() writes that record's slice
+// into the shared variable, as a size-1 hyperslab at that sample's
+// position (a size-1 slab needs no reshaping of the record's own flat
+// matrix regardless of which position in the dimension list it occupies).
 //
 // XCORRECT CONSOLIDATION
 // Up to three sheets can each carry a copy of the excitation correction
 // factor (R1andR1cBlank, R1andR1cSample, AbsSpectrumBlank) - these should
-// all represent the same physical quantity. writeXCorrect() gathers
-// whichever of these exist for a workbook, compares them, and writes a
-// single "XCorrect" variable (preferring R1andR1cBlank as the canonical
+// all represent the same physical quantity. extractXCorrect() gathers
+// whichever of these exist for a workbook, compares them, and fills in a
+// single XCorrect vector (preferring R1andR1cBlank as the canonical
 // source, matching aqualogimport.m's Xout.XCorrect). MCorrect has only
-// ever had one source, so it's unchanged, still written per-workbook on
-// the emission axis.
+// ever had one source, so it's unchanged, still extracted per-workbook on
+// the emission axis. Both are written once per bucket (see "SAMPLE-
+// INDEXED SCHEMA" above), from whichever record happens to be first in
+// the bucket - since bucketing is by exact XCorrect/MCorrect value, every
+// record in a bucket has the same one anyway.
 //
 // REDUNDANT ABSORBANCE FIELDS DROPPED
 // AbsSpectrumSample/Blank's R1, R1dark, and "horiba backup" columns were
 // confirmed by manual cross-check against the Aqualog software to be
 // identical to R1_Sample/R1_Blank/R1dark_Sample/R1dark_Blank (already
-// written from the R1andR1c sheets), so writeAbsSpectrum() now only
-// writes AbsI1_Sample/Blank and AbsI1dark_Sample/Blank - the values that
-// are unique to the absorbance sheet.
+// extracted from the R1andR1c sheets), so extractAbsSpectrum() only fills
+// in AbsI1_Sample/Blank and AbsI1dark_Sample/Blank - the values that are
+// unique to the absorbance sheet.
 //
 // SAMPLE TIMESTAMPS
 // Origin::Excel inherits Window::creationDate / Window::modificationDate
 // (time_t), which Origin sets when the workbook is created/last modified.
-// These are written per-workbook as "creation_time" / "modification_time"
-// ISO-8601 UTC string attributes.
+// These become the "creation_time"/"modification_time" ISO-8601 UTC
+// string variables, one value per sample.
 //
-// SAMPLE NAMING
+// SAMPLE IDENTITY
 // Origin::Window::name is the short internal identifier (e.g. "Book1") -
-// not what Origin displays, and not what aqualogimport.m uses.
-// Origin::Window::label is the long, human-readable name (with Origin's
-// own "(01)" auto-numbering for reused base names), matching MATLAB's
-// LongName. Aqualog's naming template appends a fixed, non-sample-specific
-// descriptor after the identifier (e.g. "AO22020 (01) - 3D Acquisition EEM
-// 3D CCD - Absorbance"); only the part through the closing parenthesis is
-// used for the group name - the full label is still kept untouched in the
-// workbook_name attribute.
+// not what Origin displays, and not what aqualogimport.m uses - it
+// becomes "workbook_short_name". Origin::Window::label is the long,
+// human-readable name (with Origin's own "(01)" auto-numbering for
+// reused base names), matching MATLAB's LongName - the full, untrimmed
+// text becomes "workbook_name", and the label's first line (see
+// extractDataIdentifier()) becomes "data_identifier". The "(NN)" counter
+// is kept in both - it's part of what LongName actually contains, and
+// nothing here second-guesses which part of the label "really" counts as
+// the identifier. The label/LongName is the *only* source
+// "data_identifier" is ever drawn from - deliberately: whatever the user
+// currently has it set to in Origin's own workbook browser is trusted at
+// face value, including any rename made after the fact, and it is never
+// cross-checked against, or overridden by, anything found inside the
+// compressed Note (see findCompressedNoteForWindow()'s comment for why -
+// two workbooks' Notes can be entirely genuine and still byte-identical,
+// so there is nothing in the Note's own text that could make it a more
+// authoritative source of identity than the label). Since a NetCDF group
+// no longer identifies an individual sample (see "SAMPLE-INDEXED SCHEMA"
+// above), there's no need for data_identifier to be unique - two samples
+// can freely share the same one; they're told apart by their position
+// along the "data_identifier" dimension, not by the string value itself.
+//
+// One exception is flagged, not silently accepted: two *different* input
+// .opj files can independently contain a workbook with the same label
+// (counter included), which Origin's own "(NN)" auto-numbering has no
+// way to catch (it only disambiguates reused names *within* one
+// project). So after all files are collected, every data_identifier used
+// by more than one source file gets "_duplicate" appended on every
+// occurrence past the first file that used it (see the tagging pass in
+// main(), right after Phase 1). This is purely an informational
+// FAIR-findability flag, not a correctness gate - the sample's data is
+// exported exactly as it would be otherwise.
 //
 // PRE-EXPORT CONSISTENCY VALIDATION
-// Before anything is written for a workbook, validateWorkbookAxes() checks
-// that every axis-bearing sheet agrees on the emission/excitation counts:
+// Before anything is extracted for a workbook, validateWorkbookAxes()
+// checks that every axis-bearing sheet agrees on the emission/excitation
+// counts:
 //   0) an S1Sample sheet must exist at all - its absence means this
 //      workbook is a blank measurement, not a sample, and is skipped with
 //      its own distinct diagnostic message (isBlank on the result)
@@ -97,24 +160,27 @@
 // (excitation vs. XCorrect is covered by checks 3/4, since XCorrect is
 // sourced from those same sheets). If any sheet disagrees - typically an
 // acquisition that was aborted partway through, leaving some sheets
-// truncated relative to others - the whole sample is skipped before any
-// NetCDF group is created, rather than exported with silent NaN gaps.
+// truncated relative to others - the whole sample is skipped before it's
+// ever collected into a SampleRecord, rather than exported with silent
+// NaN gaps.
 //
-// BATCH MODE / GROUP NAME COLLISIONS
+// BATCH MODE / SAMPLE NAME COLLISIONS
 // Two different .opj files can each contain a workbook with the same name
-// (e.g. both call it "Sample_1"). uniqueGroupName() appends a numeric
-// suffix in that case, and every group also gets a source_opj_file
-// attribute so you can always trace a sample back to its origin file.
-// Collision tracking uses an in-memory set of names already used, rather
-// than repeatedly querying the NetCDF file's existing groups.
+// (e.g. both call it "Sample_1") - this is no longer a problem to solve,
+// since a name is no longer used as a NetCDF group identifier (see
+// "SAMPLE IDENTITY" above). Every sample also gets its own
+// "source_opj_file" string variable so you can always trace it back to
+// its origin file regardless of any name collision.
 //
-// PERFORMANCE OVER LARGE BATCHES (hundreds of samples)
+// PERFORMANCE OVER LARGE BATCHES (hundreds/thousands of samples)
 // nc.set_Fill(NC_NOFILL, ...) disables netCDF's default pre-fill-then-
 // overwrite behavior for new variables. Since every variable here is
 // always fully populated immediately after creation, that pre-fill write
-// is pure redundant I/O in this code's usage pattern. Per-sample elapsed-
-// time logging (via <chrono>) is also printed to stdout for visibility
-// into large-batch runs.
+// is pure redundant I/O in this code's usage pattern. Every sample from
+// every input file is held in memory at once (see "SAMPLE-INDEXED SCHEMA"
+// above) before any NetCDF writing starts - fine even for datasets with
+// several thousand samples, but worth knowing if you're running this
+// against something far larger.
 //
 // ASSUMPTIONS TO VERIFY AGAINST YOUR OriginObj.h / OriginFile.h:
 //   - Origin::Variant has type() returning V_DOUBLE or V_STRING, plus
@@ -153,7 +219,7 @@
 #include <limits>
 #include <sstream>
 #include <string>
-#include <unordered_set>
+#include <unordered_map>
 #include <vector>
 
 using namespace netCDF;
@@ -163,6 +229,20 @@ namespace fs = std::filesystem;
 namespace {
 
 constexpr double kNaN = std::numeric_limits<double>::quiet_NaN();
+
+// Missing-value sentinel for the fields extracted from the compressed
+// Note report (integration_time, park_wavelength_nm, ccd_xbin,
+// ccd_gain_factor, data_identifier, ccd_adc_readout, ccd_gain) - written
+// (as -9999/-9999.0/"-9999") and declared via a "missing_value" attribute
+// whenever the Note wasn't found, or didn't decode far enough to reach
+// that specific field. Every other field (R1dark_*, AbsI1dark_*,
+// workbook_name, experiment_file, ...) is sourced some other way (a
+// spreadsheet, the workbook object itself) and keeps its own separate
+// missing-value convention (NaN / "") - this sentinel is specific to
+// Note-derived fields.
+constexpr double kMissingValue = -9999.0;
+constexpr int kMissingValueInt = -9999;
+const std::string kMissingValueString = "-9999";
 
 // Physical wavelength envelope of the instrument. Any row whose axis value
 // falls outside this range is treated as unused/padded and dropped.
@@ -180,6 +260,55 @@ constexpr double kXCorrectTolerance = 1e-6;
 const std::string kRequiredExperimentType = "3D Acquisition[EEM 3D CCD + Absorbance]";
 
 // ---------------------------------------------------------------------
+// Everything one exported sample contributes to the output file. Collected
+// in full for every sample across every input file before anything is
+// written to NetCDF - see organizeIntoBuckets()/writeBucket() below for
+// why: samples that share the same excitation/emission/XCorrect/MCorrect/
+// park_wavelength_nm/ccd_gain_factor/ccd_xbin/ccd_adc_readout/ccd_gain
+// are grouped together and write those shared axes once, so the grouping
+// can't be decided (and no NetCDF dimension can be sized) until every
+// sample's data is already in hand.
+// ---------------------------------------------------------------------
+struct SampleRecord
+{
+    // Axes + corrections - drive the measurement-signature grouping (see
+    // measurementSignatureKey()) and are written once per group of
+    // samples that share them, not once per sample.
+    std::vector<double> excitation, emission, xCorrect, mCorrect;
+
+    // Spectral data, sized against excitation.size()/emission.size().
+    std::vector<double> S1Sample, S1Blank;            // excitation * emission, flattened
+    std::vector<double> R1_Sample, R1_Blank;          // excitation
+    std::vector<double> AbsI1_Sample, AbsI1_Blank;    // excitation
+    std::vector<double> S1Dark_Sample, S1Dark_Blank;  // emission
+
+    // Per-sample scalars - were group attributes before this file's
+    // group-per-sample layout was replaced with sample-indexed variables.
+    double R1dark_Sample = kNaN, R1dark_Blank = kNaN;
+    double AbsI1dark_Sample = kNaN, AbsI1dark_Blank = kNaN;
+    // These four come from the compressed Note report, not a spreadsheet -
+    // see kMissingValue's comment for why they default differently.
+    double integrationTime = kMissingValue, parkWavelengthNm = kMissingValue, ccdGainFactor = kMissingValue;
+    int ccdXBin = kMissingValueInt;
+
+    // Per-sample strings - every one defaults to the same "-9999" sentinel
+    // per "netcdf variable attributes.xlsx" 's missing_value column, kept
+    // in sync with each variable's declared missing_value attribute (see
+    // kCfAttributes/kMissingValueString). None of these ever actually
+    // stays at this default in practice except the genuinely-optional
+    // ones (ccdAdcReadout, ccdGain, experimentFile, creationTime,
+    // modificationTime) - workbookName/workbookShortName/sourceOpjFile/
+    // dataIdentifier are always populated directly from the Origin
+    // object, but keep the same convention for consistency.
+    std::string workbookName{kMissingValueString}, workbookShortName{kMissingValueString};
+    std::string sourceOpjFile{kMissingValueString};
+    std::string dataIdentifier{kMissingValueString};  // workbook label/LongName's first line, "(NN)" counter kept - see extractDataIdentifier()
+    std::string ccdAdcReadout{kMissingValueString}, ccdGain{kMissingValueString};  // e.g. "500 kHz G" / "ADC Gain / 1.00"
+    std::string experimentFile{kMissingValueString};
+    std::string creationTime{kMissingValueString}, modificationTime{kMissingValueString};  // ISO-8601 UTC
+};
+
+// ---------------------------------------------------------------------
 // Small helpers
 // ---------------------------------------------------------------------
 
@@ -188,42 +317,6 @@ const std::string kRequiredExperimentType = "3D Acquisition[EEM 3D CCD + Absorba
 // repeated underscores, and trims them from both ends. Used for NetCDF
 // group/variable names, which are far stricter about allowed characters
 // than Origin's own sample-naming conventions.
-std::string safeName(const std::string& input)
-{
-    std::string out;
-    out.reserve(input.size());
-    for (char c : input)
-    {
-        if (std::isalnum(static_cast<unsigned char>(c)) || c == '_')
-            out += c;
-        else if (c == '(' || c == ')')
-            continue;
-        else
-            out += '_';
-    }
-
-    std::string collapsed;
-    collapsed.reserve(out.size());
-    for (char c : out)
-    {
-        if (c == '_' && !collapsed.empty() && collapsed.back() == '_')
-            continue;
-        collapsed += c;
-    }
-    while (!collapsed.empty() && collapsed.front() == '_')
-        collapsed.erase(collapsed.begin());
-    while (!collapsed.empty() && collapsed.back() == '_')
-        collapsed.pop_back();
-    out = collapsed;
-
-    if (out.empty())
-        out = "unnamed";
-    if (std::isdigit(static_cast<unsigned char>(out[0])))
-        out = "_" + out;
-
-    return out;
-}
-
 // Mirrors erase(worksheetName,{' ','/','-',':','_'}) in aqualogimport.m -
 // used to match sheet short names against known keys like "S1Sample".
 std::string normalizeSheetName(const std::string& input)
@@ -279,34 +372,19 @@ std::string extractXmlTag(const std::string& text, const std::string& tag)
 // of the <ExpSummary> XML - it comes from the workbook's own long
 // name/label instead. The label's first line is consistently
 // "<DataIdentifier> (<NN>)" followed by a newline and the experiment type/
-// comment text; the "(NN)" is some per-workbook creation-order counter, not
-// part of the identifier. Confirmed against all 5 independently-provided
-// real-world files (dana12/fs17/qsbs/trm_01/trm_02, spanning 3 different
-// physical instruments): the extracted value matched each file's
-// ground-truth "Data Identifier:" exactly (Dana0013, MOS17111,
-// quninesulfate, ppl00, ppl02).
+// comment text; "(NN)" is Origin's own per-workbook creation-order counter.
+// It's kept, not stripped: it's part of what Origin's LongName property
+// (and this codebase's MATLAB counterpart, workbookNameL = get(wbh,
+// 'LongName')) actually contains, and honoring the label verbatim - the
+// same principle "SAMPLE IDENTITY" above applies to the label as a whole -
+// means not second-guessing which part of it "really" counts as the
+// identifier.
 std::string extractDataIdentifier(const std::string& label)
 {
     size_t newline = label.find('\n');
     std::string firstLine = (newline == std::string::npos) ? label : label.substr(0, newline);
     while (!firstLine.empty() && (firstLine.back() == '\r' || firstLine.back() == ' '))
         firstLine.pop_back(); // labels use CRLF line endings
-
-    size_t openParen = firstLine.rfind(" (");
-    if (openParen != std::string::npos && !firstLine.empty() && firstLine.back() == ')')
-    {
-        bool digitsOnly = !firstLine.empty();
-        for (size_t i = openParen + 2; i + 1 < firstLine.size(); i++)
-        {
-            if (!isdigit(static_cast<unsigned char>(firstLine[i])))
-            {
-                digitsOnly = false;
-                break;
-            }
-        }
-        if (digitsOnly)
-            firstLine = firstLine.substr(0, openParen);
-    }
     return firstLine;
 }
 
@@ -636,21 +714,6 @@ std::string unescapeStorageBytes(const std::string& raw)
     return out;
 }
 
-// Manual (non-regex, matching this file's style) parse for "Data
-// Identifier: <value>" within a decoded note - the value runs to end of
-// line. Used to match a decoded compressed note back to the workbook it
-// belongs to (see decodeCompressedNotes() below).
-std::string extractDataIdentifierFromDecodedNote(const std::string& decoded)
-{
-    const std::string marker = "Data Identifier: ";
-    size_t pos = decoded.find(marker);
-    if (pos == std::string::npos)
-        return "";
-    pos += marker.size();
-    size_t end = decoded.find_first_of("\r\n", pos);
-    return decoded.substr(pos, end == std::string::npos ? std::string::npos : end - pos);
-}
-
 // Manual parse for "Park: <number>nm". Returns "" if not found, or if the
 // text right after "Park: " isn't cleanly digits/'.' immediately followed
 // by "nm" - which in practice is exactly what happens once the decoded
@@ -780,18 +843,19 @@ double ccdGainFactorFromReport(const std::string& adcText, const std::string& ga
 
 struct CompressedNoteCandidate
 {
-    std::string dataIdentifier;  // "" if not found (decode failed too early, or this slot is empty)
     std::string decodedText;
+    // Byte offset, in the source file, of this record's own
+    // "@${[0|5|..." marker - used to test structural containment within a
+    // workbook's [dataStartOffset, dataEndOffset) range (see
+    // findCompressedNoteForWindow()).
+    size_t markerOffset = 0;
 };
 
 // Scans the raw file bytes for every compressed ("kind 5")
 // "_Storage_Ebdded_pages_Data_" record and best-effort decodes each one.
 // One file can (and typically does) hold many of these - one per
 // workbook-template sample-note slot, most of them empty leftovers from
-// other samples that reused the same template - so the caller matches the
-// result back to a specific workbook by comparing CompressedNoteCandidate::
-// dataIdentifier against that workbook's own (already-reliable, XML-based)
-// data identifier, rather than assuming a fixed position.
+// other samples that reused the same template.
 std::vector<CompressedNoteCandidate> decodeCompressedNotes(const std::string& fileBytes)
 {
     std::vector<CompressedNoteCandidate> candidates;
@@ -800,6 +864,7 @@ std::vector<CompressedNoteCandidate> decodeCompressedNotes(const std::string& fi
     size_t pos = 0;
     while ((pos = fileBytes.find(marker, pos)) != std::string::npos)
     {
+        size_t markerOffset = pos;
         size_t fieldsEnd = fileBytes.find("]}", pos);
         if (fieldsEnd == std::string::npos)
             break;
@@ -824,14 +889,49 @@ std::vector<CompressedNoteCandidate> decodeCompressedNotes(const std::string& fi
         std::string decoded = pkware::decode(unescapeStorageBytes(fileBytes.substr(payloadStart, size)));
 
         CompressedNoteCandidate candidate;
-        candidate.dataIdentifier = extractDataIdentifierFromDecodedNote(decoded);
         candidate.decodedText = std::move(decoded);
+        candidate.markerOffset = markerOffset;
         candidates.push_back(std::move(candidate));
 
         pos = payloadStart + size;
     }
 
     return candidates;
+}
+
+// Finds the Note that structurally belongs to a given workbook: the one
+// whose own storage-record marker offset falls inside [dataStartOffset,
+// dataEndOffset) - i.e. it's physically nested inside that workbook's own
+// serialized data in the file, which is how Origin itself associates a
+// Note with its owning workbook (see dataStartOffset's comment in
+// OriginObj.h). No identifier-text comparison, duplicate-content
+// detection, or any other content-based judgment is involved - the Note
+// found this way is trusted unconditionally as a genuine record of this
+// workbook's own acquisition. Two workbooks' Notes can be byte-identical
+// (e.g. an operator ran two samples back to back without changing any
+// setting, including the Data Identifier field, in Aqualog's own
+// acquisition dialogue) without either one being any less genuine - the
+// only thing that actually differs between such runs (their true
+// measurement time) isn't part of the Note's own text at all, so content
+// identity carries no information about which one is "real". Returns
+// nullptr if no EM1-bearing record falls in range, or if more than one
+// does (never observed, but ambiguous if it happened).
+const CompressedNoteCandidate* findCompressedNoteForWindow(const std::vector<CompressedNoteCandidate>& compressedNotes,
+                                                             long long dataStartOffset, long long dataEndOffset)
+{
+    const CompressedNoteCandidate* match = nullptr;
+    for (const auto& candidate : compressedNotes)
+    {
+        if (static_cast<long long>(candidate.markerOffset) < dataStartOffset ||
+            static_cast<long long>(candidate.markerOffset) >= dataEndOffset)
+            continue;
+        if (candidate.decodedText.find("\r\nEM1:") == std::string::npos)
+            continue;
+        if (match)
+            return nullptr;  // more than one - ambiguous, shouldn't happen
+        match = &candidate;
+    }
+    return match;
 }
 
 // Reads a whole file into memory (used to scan for compressed-note storage
@@ -909,23 +1009,6 @@ std::vector<double> gatherValues(Origin::SpreadColumn& col, const std::vector<si
             out[i] = variantToDouble(col.data[rows[i]]);
     }
     return out;
-}
-
-// Appends a numeric suffix if `baseName` is already present in `usedNames`
-// (populated as groups are created). Checking against this in-memory set
-// is O(1) on average, unlike repeatedly querying the NetCDF file's
-// existing groups.
-std::string uniqueGroupName(std::unordered_set<std::string>& usedNames, const std::string& baseName)
-{
-    if (usedNames.insert(baseName).second)
-        return baseName;
-
-    for (int suffix = 2;; suffix++)
-    {
-        std::string candidate = baseName + "_" + std::to_string(suffix);
-        if (usedNames.insert(candidate).second)
-            return candidate;
-    }
 }
 
 // Lower-cased file extension, e.g. ".opj" or ".ogw".
@@ -1168,7 +1251,10 @@ SheetKind classifySheet(const std::string& normalizedName)
 }
 
 // ---------------------------------------------------------------------
-// Per-sheet-type writers
+// Per-sheet-type extractors - fill in a SampleRecord's fields instead of
+// writing directly to NetCDF. Writing happens later, once per bucket of
+// samples that share the same measurement signature (see
+// measurementSignatureKey()/writeBucket()), not once per sample.
 // ---------------------------------------------------------------------
 
 // S1Sample / S1Blank: emission x excitation matrix.
@@ -1177,17 +1263,17 @@ SheetKind classifySheet(const std::string& normalizedName)
 //
 // netCDF stores dimensions in C order (first declared = slowest-varying),
 // but MATLAB's ncread() reverses dimension order on read to keep indexing
-// natural for its column-major arrays. Declaring (excitation, emission)
-// here - the reverse of the natural reading order - means ncread() in
-// MATLAB returns an array shaped (emission, excitation), matching how the
-// Aqualog software displays it. The values array below is filled to match
-// this declared order: excitation-major (outer), emission-minor (inner).
-void writeEemMatrix(NcGroup& group, Origin::SpreadSheet& sheet,
-                     const NcDim& emDim, const NcDim& exDim,
-                     const std::vector<size_t>& emRows,
-                     const std::string& varName)
+// natural for its column-major arrays. writeBucket() declares
+// (sample, excitation, emission) - so that ncread() in MATLAB returns an
+// array shaped (emission, excitation, sample), matching how the Aqualog
+// software displays each sample's own matrix. The values array below is
+// filled to match: excitation-major (outer), emission-minor (inner) -
+// the (sample) dimension is added later, when this record's slice is
+// written into the shared variable.
+void extractEemMatrix(Origin::SpreadSheet& sheet, const std::vector<size_t>& emRows,
+                       size_t exCount, const std::string& varName, SampleRecord& record)
 {
-    if (sheet.columns.size() < 2 || emDim.isNull() || exDim.isNull() || emRows.empty())
+    if (sheet.columns.size() < 2 || exCount == 0 || emRows.empty())
     {
         std::cerr << "  [warn] sheet '" << sheet.name
                   << "': too few columns, or missing emission/excitation axis - skipped\n";
@@ -1195,7 +1281,7 @@ void writeEemMatrix(NcGroup& group, Origin::SpreadSheet& sheet,
     }
 
     const size_t rows = emRows.size();
-    const size_t cols = static_cast<size_t>(exDim.getSize());
+    const size_t cols = exCount;
 
     if (sheet.columns.size() - 1 != cols)
     {
@@ -1220,19 +1306,20 @@ void writeEemMatrix(NcGroup& group, Origin::SpreadSheet& sheet,
         }
     }
 
-    NcVar intensity = group.addVar(varName, ncDouble, {exDim, emDim});
-    intensity.putVar(values.data());
-    intensity.putAtt("coordinates", "excitation emission");
+    if (varName == "S1Sample")
+        record.S1Sample = std::move(values);
+    else
+        record.S1Blank = std::move(values);
 }
 
 // R1andR1cSample / R1andR1cBlank: one row per excitation wavelength.
-// XCorrect (column 3, Blank only) is handled separately by writeXCorrect()
-// since it's one of several redundant sources for the same quantity.
-void writeExcitationVector(NcGroup& group, Origin::SpreadSheet& sheet,
-                            const NcDim& exDim, const std::vector<size_t>& exRows,
-                            const std::string& label)
+// XCorrect (column 3, Blank only) is handled separately by
+// extractXCorrect() since it's one of several redundant sources for the
+// same quantity.
+void extractExcitationVector(Origin::SpreadSheet& sheet, const std::vector<size_t>& exRows,
+                              const std::string& label, SampleRecord& record)
 {
-    if (sheet.columns.size() < 3 || exDim.isNull() || exRows.empty())
+    if (sheet.columns.size() < 3 || exRows.empty())
     {
         std::cerr << "  [warn] sheet '" << sheet.name
                   << "': too few columns, or missing excitation axis - skipped\n";
@@ -1240,22 +1327,28 @@ void writeExcitationVector(NcGroup& group, Origin::SpreadSheet& sheet,
     }
 
     std::vector<double> r1 = gatherValues(sheet.columns[1], exRows);
-    NcVar r1Var = group.addVar("R1_" + label, ncDouble, exDim);
-    r1Var.putVar(r1.data());
-
     double r1dark = sheet.columns[2].data.empty() ? kNaN : variantToDouble(sheet.columns[2].data[0]);
-    group.putAtt("R1dark_" + label, ncDouble, r1dark);
+
+    if (label == "Sample")
+    {
+        record.R1_Sample = std::move(r1);
+        record.R1dark_Sample = r1dark;
+    }
+    else
+    {
+        record.R1_Blank = std::move(r1);
+        record.R1dark_Blank = r1dark;
+    }
 }
 
 // S1DarkandMCorrectSample / S1DarkandMCorrectBlank: one row per emission
 // wavelength, no reversal. MCorrect has only ever had one source sheet
-// (the Blank one), so it's written directly here rather than through the
-// comparison routine used for XCorrect.
-void writeEmissionVector(NcGroup& group, Origin::SpreadSheet& sheet,
-                          const NcDim& emDim, const std::vector<size_t>& emRows,
-                          const std::string& label)
+// (the Blank one), so it's filled in directly here rather than through
+// the comparison routine used for XCorrect.
+void extractEmissionVector(Origin::SpreadSheet& sheet, const std::vector<size_t>& emRows,
+                            const std::string& label, SampleRecord& record)
 {
-    if (sheet.columns.size() < 2 || emDim.isNull() || emRows.empty())
+    if (sheet.columns.size() < 2 || emRows.empty())
     {
         std::cerr << "  [warn] sheet '" << sheet.name
                   << "': too few columns, or missing emission axis - skipped\n";
@@ -1263,28 +1356,25 @@ void writeEmissionVector(NcGroup& group, Origin::SpreadSheet& sheet,
     }
 
     std::vector<double> dark = gatherValues(sheet.columns[1], emRows);
-    NcVar darkVar = group.addVar("S1Dark_" + label, ncDouble, emDim);
-    darkVar.putVar(dark.data());
+    if (label == "Sample")
+        record.S1Dark_Sample = std::move(dark);
+    else
+        record.S1Dark_Blank = std::move(dark);
 
     if (label == "Blank" && sheet.columns.size() > 2)
-    {
-        std::vector<double> MCorrect = gatherValues(sheet.columns[2], emRows);
-        NcVar mVar = group.addVar("MCorrect", ncDouble, emDim);
-        mVar.putVar(MCorrect.data());
-    }
+        record.mCorrect = gatherValues(sheet.columns[2], emRows);
 }
 
 // AbsSpectrumSample / AbsSpectrumBlank: absorbance vs. wavelength, on the
-// shared "excitation" axis. Only AbsI1/AbsI1dark are written - the sheet's
-// R1, R1dark, and "horiba backup" columns were confirmed by manual
-// cross-check to be identical to R1_Sample/R1_Blank/R1dark_Sample/
-// R1dark_Blank (already written from the R1andR1c sheets), so they're
+// shared "excitation" axis. Only AbsI1/AbsI1dark are extracted - the
+// sheet's R1, R1dark, and "horiba backup" columns were confirmed by
+// manual cross-check to be identical to R1_Sample/R1_Blank/R1dark_Sample/
+// R1dark_Blank (already extracted from the R1andR1c sheets), so they're
 // intentionally not duplicated here.
-void writeAbsSpectrum(NcGroup& group, Origin::SpreadSheet& sheet,
-                       const NcDim& exDim, const std::vector<size_t>& exRows,
-                       const std::string& label)
+void extractAbsSpectrum(Origin::SpreadSheet& sheet, const std::vector<size_t>& exRows,
+                         const std::string& label, SampleRecord& record)
 {
-    if (sheet.columns.size() < 3 || exDim.isNull() || exRows.empty())
+    if (sheet.columns.size() < 3 || exRows.empty())
     {
         std::cerr << "  [warn] sheet '" << sheet.name
                   << "': fewer columns than expected, or missing excitation axis - skipped\n";
@@ -1292,32 +1382,38 @@ void writeAbsSpectrum(NcGroup& group, Origin::SpreadSheet& sheet,
     }
 
     std::vector<double> v = gatherValues(sheet.columns[1], exRows);
-    NcVar var = group.addVar("AbsI1_" + label, ncDouble, exDim);
-    var.putVar(v.data());
+    double dark = sheet.columns[2].data.empty() ? kNaN : variantToDouble(sheet.columns[2].data[0]);
 
-    group.putAtt("AbsI1dark_" + label, ncDouble,
-                 sheet.columns[2].data.empty() ? kNaN : variantToDouble(sheet.columns[2].data[0]));
+    if (label == "Sample")
+    {
+        record.AbsI1_Sample = std::move(v);
+        record.AbsI1dark_Sample = dark;
+    }
+    else
+    {
+        record.AbsI1_Blank = std::move(v);
+        record.AbsI1dark_Blank = dark;
+    }
 }
 
 // XCorrect: up to three sheets can each carry a copy of this correction
 // factor - R1andR1cBlank (column 3), R1andR1cSample (column 3, if
 // present), and AbsSpectrumBlank (column 5). Gathers whichever exist,
-// compares them, and writes exactly one "XCorrect" variable per workbook.
+// compares them, and fills in exactly one XCorrect vector per workbook.
 struct XCorrectCandidate
 {
     std::string source;
     std::vector<double> values;
 };
 
-void writeXCorrect(NcGroup& group, Origin::Excel& book,
-                    const NcDim& exDim, const std::vector<size_t>& exRows)
+void extractXCorrect(Origin::Excel& book, const std::vector<size_t>& exRows, SampleRecord& record)
 {
-    if (exDim.isNull() || exRows.empty())
+    if (exRows.empty())
         return;
 
     std::vector<XCorrectCandidate> candidates;
 
-    // Order here is also the priority order used to pick the written
+    // Order here is also the priority order used to pick the extracted
     // value: R1andR1cBlank first, matching aqualogimport.m's Xout.XCorrect.
     auto tryAdd = [&](const char* sheetKey, size_t colIndex) {
         Origin::SpreadSheet* sheet = findSheet(book, sheetKey);
@@ -1355,18 +1451,15 @@ void writeXCorrect(NcGroup& group, Origin::Excel& book,
                   << maxDiff << "\n";
     }
 
-    NcVar var = group.addVar("XCorrect", ncDouble, exDim);
-    var.putVar(candidates.front().values.data());
+    record.xCorrect = candidates.front().values;
 }
 
 // ---------------------------------------------------------------------
-// Builds the shared per-workbook axes before any sheet data is written.
+// Extracts the shared per-workbook axes before any sheet data is read.
 // ---------------------------------------------------------------------
 
 struct WorkbookAxes
 {
-    NcDim emDim;
-    NcDim exDim;
     std::vector<size_t> emRows;
     std::vector<size_t> exRows;
 };
@@ -1374,7 +1467,7 @@ struct WorkbookAxes
 // Called only after validateWorkbookAxes() has confirmed the workbook is
 // well-formed - in particular, that S1Sample exists - so no S1Blank
 // fallback is needed here for the emission axis.
-WorkbookAxes buildAxes(NcGroup& group, Origin::Excel& book)
+WorkbookAxes extractAxes(Origin::Excel& book, SampleRecord& record)
 {
     WorkbookAxes axes;
 
@@ -1384,13 +1477,7 @@ WorkbookAxes buildAxes(NcGroup& group, Origin::Excel& book)
     {
         axes.emRows = validAscendingRowOrder(emSource->columns[0]);
         if (!axes.emRows.empty())
-        {
-            std::vector<double> emission = gatherValues(emSource->columns[0], axes.emRows);
-            axes.emDim = group.addDim("emission", emission.size());
-            NcVar emVar = group.addVar("emission", ncDouble, axes.emDim);
-            emVar.putAtt("units", "nm");
-            emVar.putVar(emission.data());
-        }
+            record.emission = gatherValues(emSource->columns[0], axes.emRows);
     }
 
     for (const char* key : {"R1andR1cSample", "R1andR1cBlank", "AbsSpectrumSample", "AbsSpectrumBlank"})
@@ -1404,22 +1491,18 @@ WorkbookAxes buildAxes(NcGroup& group, Origin::Excel& book)
             continue;
 
         axes.exRows = rows;
-        std::vector<double> excitation = gatherValues(sheet->columns[0], rows);
-        axes.exDim = group.addDim("excitation", excitation.size());
-        NcVar exVar = group.addVar("excitation", ncDouble, axes.exDim);
-        exVar.putAtt("units", "nm");
-        exVar.putVar(excitation.data());
+        record.excitation = gatherValues(sheet->columns[0], rows);
         break;
     }
 
-    if (!axes.exDim.isNull() && emSource)
+    if (!record.excitation.empty() && emSource)
     {
         size_t matrixCols = emSource->columns.size() - 1;
-        if (matrixCols != static_cast<size_t>(axes.exDim.getSize()))
+        if (matrixCols != record.excitation.size())
         {
             std::cerr << "  [warn] workbook '" << book.label << "': EEM matrix has "
                       << matrixCols << " columns but the excitation axis has "
-                      << axes.exDim.getSize() << " values - under the combined protocol these "
+                      << record.excitation.size() << " values - under the combined protocol these "
                       << "should match; double check this workbook\n";
         }
     }
@@ -1427,57 +1510,458 @@ WorkbookAxes buildAxes(NcGroup& group, Origin::Excel& book)
     return axes;
 }
 
-// Exports every recognized sheet of one workbook into `group`.
-void exportWorkbook(NcGroup& group, Origin::Excel& book)
+// Extracts every recognized sheet of one workbook into a fresh SampleRecord.
+// Only the axes/spectral/XCorrect/MCorrect fields are filled in here - the
+// caller (main()) fills in the identity and report-derived fields.
+SampleRecord extractWorkbook(Origin::Excel& book)
 {
-    WorkbookAxes axes = buildAxes(group, book);
-    writeXCorrect(group, book, axes.exDim, axes.exRows);
+    SampleRecord record;
+    WorkbookAxes axes = extractAxes(book, record);
+    extractXCorrect(book, axes.exRows, record);
 
     for (auto& sheet : book.sheets)
     {
         std::string key = normalizeSheetName(sheet.name);
         SheetKind kind = classifySheet(key);
 
-        try
+        switch (kind)
         {
-            switch (kind)
-            {
-                case SheetKind::Skip:
-                    break;
-                case SheetKind::MatrixSample:
-                    writeEemMatrix(group, sheet, axes.emDim, axes.exDim, axes.emRows, "S1Sample");
-                    break;
-                case SheetKind::MatrixBlank:
-                    writeEemMatrix(group, sheet, axes.emDim, axes.exDim, axes.emRows, "S1Blank");
-                    break;
-                case SheetKind::ExcitationVectorSample:
-                    writeExcitationVector(group, sheet, axes.exDim, axes.exRows, "Sample");
-                    break;
-                case SheetKind::ExcitationVectorBlank:
-                    writeExcitationVector(group, sheet, axes.exDim, axes.exRows, "Blank");
-                    break;
-                case SheetKind::EmissionVectorSample:
-                    writeEmissionVector(group, sheet, axes.emDim, axes.emRows, "Sample");
-                    break;
-                case SheetKind::EmissionVectorBlank:
-                    writeEmissionVector(group, sheet, axes.emDim, axes.emRows, "Blank");
-                    break;
-                case SheetKind::AbsSample:
-                    writeAbsSpectrum(group, sheet, axes.exDim, axes.exRows, "Sample");
-                    break;
-                case SheetKind::AbsBlank:
-                    writeAbsSpectrum(group, sheet, axes.exDim, axes.exRows, "Blank");
-                    break;
-                case SheetKind::Unknown:
-                    break;
-            }
-        }
-        catch (const NcException& e)
-        {
-            std::cerr << "  [error] sheet '" << sheet.name << "' in workbook '" << book.label
-                      << "': " << e.what() << "\n";
+            case SheetKind::Skip:
+                break;
+            case SheetKind::MatrixSample:
+                extractEemMatrix(sheet, axes.emRows, axes.exRows.size(), "S1Sample", record);
+                break;
+            case SheetKind::MatrixBlank:
+                extractEemMatrix(sheet, axes.emRows, axes.exRows.size(), "S1Blank", record);
+                break;
+            case SheetKind::ExcitationVectorSample:
+                extractExcitationVector(sheet, axes.exRows, "Sample", record);
+                break;
+            case SheetKind::ExcitationVectorBlank:
+                extractExcitationVector(sheet, axes.exRows, "Blank", record);
+                break;
+            case SheetKind::EmissionVectorSample:
+                extractEmissionVector(sheet, axes.emRows, "Sample", record);
+                break;
+            case SheetKind::EmissionVectorBlank:
+                extractEmissionVector(sheet, axes.emRows, "Blank", record);
+                break;
+            case SheetKind::AbsSample:
+                extractAbsSpectrum(sheet, axes.exRows, "Sample", record);
+                break;
+            case SheetKind::AbsBlank:
+                extractAbsSpectrum(sheet, axes.exRows, "Blank", record);
+                break;
+            case SheetKind::Unknown:
+                break;
         }
     }
+
+    return record;
+}
+
+// ---------------------------------------------------------------------
+// Grouping samples by measurement signature, and writing a group of
+// samples that share one (see the top-of-file overview for why: samples
+// with identical excitation/emission/XCorrect/MCorrect write those once,
+// not once per sample).
+// ---------------------------------------------------------------------
+
+// Exact-match key over a sample's excitation + emission + XCorrect +
+// MCorrect values, plus park_wavelength_nm/ccd_gain_factor/ccd_xbin/
+// ccd_adc_readout/ccd_gain - any difference in any of these means the
+// samples don't genuinely share one measurement configuration and belong
+// in different buckets/groups. Numeric fields are the raw bytes,
+// length-prefixed per vector so a longer array can never coincidentally
+// collide with a shorter one that shares the same leading bytes; string
+// fields are length-prefixed too, for the same reason. Deliberately
+// exact, not a numeric tolerance: these values are read directly from
+// stored data, not recomputed, so the same instrument configuration
+// should reproduce identically.
+std::string measurementSignatureKey(const SampleRecord& record)
+{
+    std::string key;
+    auto appendVec = [&](const std::vector<double>& v) {
+        size_t n = v.size();
+        key.append(reinterpret_cast<const char*>(&n), sizeof(n));
+        if (n > 0)
+            key.append(reinterpret_cast<const char*>(v.data()), n * sizeof(double));
+    };
+    auto appendDouble = [&](double d) { key.append(reinterpret_cast<const char*>(&d), sizeof(d)); };
+    auto appendInt = [&](int i) { key.append(reinterpret_cast<const char*>(&i), sizeof(i)); };
+    auto appendString = [&](const std::string& s) {
+        size_t n = s.size();
+        key.append(reinterpret_cast<const char*>(&n), sizeof(n));
+        key.append(s);
+    };
+    appendVec(record.excitation);
+    appendVec(record.emission);
+    appendVec(record.xCorrect);
+    appendVec(record.mCorrect);
+    appendDouble(record.parkWavelengthNm);
+    appendDouble(record.ccdGainFactor);
+    appendInt(record.ccdXBin);
+    appendString(record.ccdAdcReadout);
+    appendString(record.ccdGain);
+    return key;
+}
+
+// Buckets records by exact measurement signature, preserving first-seen
+// order of both buckets and records within a bucket.
+std::vector<std::vector<SampleRecord*>> organizeIntoBuckets(std::vector<SampleRecord>& records)
+{
+    std::vector<std::vector<SampleRecord*>> buckets;
+    std::unordered_map<std::string, size_t> bucketIndexBySignature;
+
+    for (SampleRecord& record : records)
+    {
+        std::string key = measurementSignatureKey(record);
+        auto it = bucketIndexBySignature.find(key);
+        if (it == bucketIndexBySignature.end())
+        {
+            bucketIndexBySignature.emplace(key, buckets.size());
+            buckets.push_back({&record});
+        }
+        else
+        {
+            buckets[it->second].push_back(&record);
+        }
+    }
+
+    return buckets;
+}
+
+// Writes a 1D double variable dimensioned only by `sampleDim`, one value
+// per record in `bucket`, in bucket order. Returns the NcVar so the
+// caller can attach a missing_value attribute where that convention
+// applies (see kMissingValue).
+NcVar writeSampleDoubleVar(NcGroup& scope, const NcDim& sampleDim, const std::string& name,
+                            const std::vector<SampleRecord*>& bucket,
+                            double SampleRecord::*field)
+{
+    NcVar var = scope.addVar(name, ncDouble, sampleDim);
+    for (size_t i = 0; i < bucket.size(); i++)
+    {
+        double value = bucket[i]->*field;
+        var.putVar({i}, {1}, &value);
+    }
+    return var;
+}
+
+// Writes a 1D nc_STRING variable dimensioned only by `sampleDim`, one
+// value per record in `bucket`, in bucket order. Returns the NcVar so the
+// caller can attach a missing_value attribute where that convention
+// applies (see kMissingValue).
+NcVar writeSampleStringVar(NcGroup& scope, const NcDim& sampleDim, const std::string& name,
+                            const std::vector<SampleRecord*>& bucket,
+                            std::string SampleRecord::*field)
+{
+    NcVar var = scope.addVar(name, ncString, sampleDim);
+    for (size_t i = 0; i < bucket.size(); i++)
+    {
+        const char* value = (bucket[i]->*field).c_str();
+        var.putVar({i}, {1}, &value);
+    }
+    return var;
+}
+
+// Writes a 1D double variable dimensioned by `dim` (excitation or
+// emission), one per record's own vector, into a (dim, sample) variable -
+// declared dim-first (not sample-first) for the same MATLAB-ncread reason
+// as S1Sample/S1Blank (see "EEM MATRIX DIMENSION ORDER" at the top of the
+// file): netCDF's C-order is reversed on read, so dim-first here becomes
+// sample-first once read into MATLAB.
+void writeSample1dVar(NcVar& var, size_t i, const std::vector<double>& values, size_t expectedSize)
+{
+    if (values.size() != expectedSize)
+        return;  // left at the variable's default fill value - see nc.set_Fill() at the call site
+    var.putVar({0, i}, {expectedSize, 1}, values.data());
+}
+
+// CF/ACDD descriptive attributes per variable, transcribed from
+// "netcdf variable attributes.xlsx" (kept alongside this file). A null
+// field means the spreadsheet said not to set that attribute for this
+// variable (e.g. most variables have no applicable CF standard_name, and
+// excitation/emission/the Note-derived scalars/identity strings are
+// deliberately not given a "coordinates" attribute, since nothing else
+// references them the way S1Sample etc. reference excitation/emission/
+// data_identifier). missing_value is handled separately, alongside each
+// field's own default (see kMissingValue's comment) - not part of this
+// table, since it also has to match the SampleRecord field's actual
+// sentinel value, not just a written attribute.
+struct CfAttributes
+{
+    const char* standardName;
+    const char* longName;
+    const char* coverageContentType;
+    const char* units;
+    const char* coordinates;
+};
+
+const std::unordered_map<std::string, CfAttributes> kCfAttributes = {
+    {"excitation", {"radiation_wavelength",
+                     "Excitation wavelength in nm, coordinate variable physicalMeasurement types "
+                     "fluorescence_sample fluorescence_blank",
+                     "coordinate", "nanometer", nullptr}},
+    {"emission", {"radiation_wavelength",
+                   "Emission wavelength in nm, coordinate variable physicalMeasurement types "
+                   "fluorescence_sample fluorescence_blank",
+                   "coordinate", "nanometer", nullptr}},
+    {"XCorrect", {nullptr, "Instrumen-specific excitation correction factors for multiplication of signal",
+                   "physicalMeasurement", "1", "excitation"}},
+    {"MCorrect", {nullptr, "Instrumen-specific emission correction factors for multiplication of signal",
+                   "physicalMeasurement", "1", "emission"}},
+    {"S1Sample", {nullptr, "Raw, entirely uncorrected fluorescence observations resulting from the excitation of the sample",
+                   "physicalMeasurement", "1", "data_identifier emission excitation"}},
+    {"S1Blank", {nullptr, "Raw, entirely uncorrected fluorescence observations resulting from the excitation of the blank",
+                  "physicalMeasurement", "1", "data_identifier emission excitation"}},
+    {"R1_Sample", {nullptr, "Intensity of the reference diode at every excitation wavelength during the sample measurement",
+                    "physicalMeasurement", "1", "data_identifier excitation"}},
+    {"R1_Blank", {nullptr, "Intensity of the reference diode at every excitation wavelength during the blank measurement",
+                   "physicalMeasurement", "1", "data_identifier excitation"}},
+    {"AbsI1_Sample", {nullptr, "Raw, entirely uncorrected diode intensity after the attenuation of light by the sample",
+                       "physicalMeasurement", "1", "data_identifier excitation"}},
+    {"AbsI1_Blank", {nullptr, "Raw, entirely uncorrected diode intensity after the attenuation of light by the blank",
+                      "physicalMeasurement", "1", "data_identifier excitation"}},
+    {"S1Dark_Sample", {nullptr, "CCD detector signal under dark conditions immediately prior to sample measurement",
+                        "physicalMeasurement", "1", "data_identifier emission"}},
+    {"S1Dark_Blank", {nullptr, "CCD detector signal under dark conditions immediately prior to blank measurement",
+                       "physicalMeasurement", "1", "data_identifier emission"}},
+    {"R1dark_Sample", {nullptr, "Intensity of the reference diode under dark conditions immediately prior to sample measurement",
+                        "physicalMeasurement", "1", "data_identifier"}},
+    {"R1dark_Blank", {nullptr, "Intensity of the reference diode under dark conditions immediately prior to blank measurement",
+                       "physicalMeasurement", "1", "data_identifier"}},
+    {"AbsI1dark_Sample", {nullptr, "Intensity of the absorbance diode under dark conditions immediately prior to sample measurement",
+                           "physicalMeasurement", "1", "data_identifier"}},
+    {"AbsI1dark_Blank", {nullptr, "Intensity of the absorbance diode under dark conditions immediately prior to blank measurement",
+                          "physicalMeasurement", "1", "data_identifier"}},
+    {"integration_time", {nullptr, "Integration time used for the measurement",
+                           "auxiliaryInformation", "1", "data_identifier"}},
+    {"park_wavelength_nm", {nullptr, "Fixed centering value of the emission detector",
+                             "auxiliaryInformation", "1", "data_identifier"}},
+    {"ccd_gain_factor", {nullptr, "Detector gain factor", "auxiliaryInformation", "1", "data_identifier"}},
+    {"ccd_xbin", {nullptr, "Pixel binning of emission detector", "auxiliaryInformation", "1", "data_identifier"}},
+    {"workbook_name", {nullptr, "Sample identifier as retreived from the workbook property",
+                        "auxiliaryInformation", "1", "data_identifier"}},
+    {"workbook_short_name", {nullptr, "Sample identifier as retreived from the short identifier workbook property",
+                              "auxiliaryInformation", "1", "data_identifier"}},
+    {"source_opj_file", {nullptr, "File from which the measurements were extracted",
+                          "auxiliaryInformation", "1", "data_identifier"}},
+    // data_identifier acts as the sample-identifying coordinate that every
+    // other variable's "coordinates" attribute above points to (like
+    // excitation/emission for their own dimensions) - so, like those two,
+    // it's coverage_content_type "coordinate" and gets no coordinates
+    // attribute of its own.
+    {"data_identifier", {nullptr, "Data identifier as provided prior to measurement",
+                          "coordinate", "1", nullptr}},
+    {"ccd_adc_readout", {nullptr, "Gain setting 1", "auxiliaryInformation", "1", "data_identifier"}},
+    {"ccd_gain", {nullptr, "Gain setting 2", "auxiliaryInformation", "1", "data_identifier"}},
+    {"experiment_file", {nullptr, "The XML file from which the measurement was orchestrated",
+                          "auxiliaryInformation", "1", "data_identifier"}},
+    {"creation_time", {nullptr, "Date and time at which the measurement finished.",
+                        "auxiliaryInformation", "1", "data_identifier"}},
+    {"modification_time", {nullptr, "Date and time at which the data processing finished.",
+                            "auxiliaryInformation", "1", "data_identifier"}},
+};
+
+void applyCfAttributes(NcVar var, const std::string& variableName)
+{
+    auto it = kCfAttributes.find(variableName);
+    if (it == kCfAttributes.end())
+        return;
+    const CfAttributes& a = it->second;
+    if (a.standardName)
+        var.putAtt("standard_name", a.standardName);
+    if (a.longName)
+        var.putAtt("long_name", a.longName);
+    if (a.coverageContentType)
+        var.putAtt("coverage_content_type", a.coverageContentType);
+    if (a.units)
+        var.putAtt("units", a.units);
+    if (a.coordinates)
+        var.putAtt("coordinates", a.coordinates);
+}
+
+// missing_value declarations per "netcdf variable attributes.xlsx" -
+// applied to every variable listed there, using whichever overload
+// matches that variable's own netCDF type. Declaring this attribute
+// doesn't require -9999/-9999.0/"-9999" to actually appear in a given
+// variable's data - most physicalMeasurement variables here still use
+// NaN for their own, pre-existing missing-data cases (a whole sheet
+// absent, unrelated to Note extraction - see each extractor's comment);
+// this is metadata documenting the convention, per CF/ACDD, not a
+// rewrite of how missing spectral data is represented.
+void applyMissingValueDouble(NcVar var) { var.putAtt("missing_value", ncDouble, kMissingValue); }
+void applyMissingValueInt(NcVar var) { var.putAtt("missing_value", ncInt, kMissingValueInt); }
+void applyMissingValueString(NcVar var) { var.putAtt("missing_value", kMissingValueString); }
+
+// Writes one bucket of samples (all sharing the same excitation/emission/
+// XCorrect/MCorrect) into `scope`, which is either the top-level NcFile
+// (only one bucket in the whole export) or one NcGroup per bucket (more
+// than one).
+void writeBucket(NcGroup scope, const std::vector<SampleRecord*>& bucket)
+{
+    const SampleRecord& first = *bucket.front();
+    size_t exCount = first.excitation.size();
+    size_t emCount = first.emission.size();
+
+    // Named "data_identifier", not "sample": data_identifier is this
+    // dimension's coordinate variable (see kCfAttributes - it's the one
+    // thing every other variable's own "coordinates" attribute points
+    // back to, just like excitation/emission are for their own
+    // dimensions), so the dimension and the coordinate variable that
+    // describes it share a name, per the usual CF/netCDF convention.
+    NcDim sampleDim = scope.addDim("data_identifier", bucket.size());
+    NcDim exDim = scope.addDim("excitation", exCount);
+    NcDim emDim = scope.addDim("emission", emCount);
+
+    NcVar exVar = scope.addVar("excitation", ncDouble, exDim);
+    applyCfAttributes(exVar, "excitation");
+    applyMissingValueDouble(exVar);
+    exVar.putVar(first.excitation.data());
+
+    NcVar emVar = scope.addVar("emission", ncDouble, emDim);
+    applyCfAttributes(emVar, "emission");
+    applyMissingValueDouble(emVar);
+    emVar.putVar(first.emission.data());
+
+    if (!first.xCorrect.empty())
+    {
+        NcVar xVar = scope.addVar("XCorrect", ncDouble, exDim);
+        applyCfAttributes(xVar, "XCorrect");
+        applyMissingValueDouble(xVar);
+        xVar.putVar(first.xCorrect.data());
+    }
+    if (!first.mCorrect.empty())
+    {
+        NcVar mVar = scope.addVar("MCorrect", ncDouble, emDim);
+        applyCfAttributes(mVar, "MCorrect");
+        applyMissingValueDouble(mVar);
+        mVar.putVar(first.mCorrect.data());
+    }
+
+    NcVar s1Sample = scope.addVar("S1Sample", ncDouble, {exDim, emDim, sampleDim});
+    applyCfAttributes(s1Sample, "S1Sample");
+    applyMissingValueDouble(s1Sample);
+    NcVar s1Blank = scope.addVar("S1Blank", ncDouble, {exDim, emDim, sampleDim});
+    applyCfAttributes(s1Blank, "S1Blank");
+    applyMissingValueDouble(s1Blank);
+    NcVar r1Sample = scope.addVar("R1_Sample", ncDouble, {exDim, sampleDim});
+    applyCfAttributes(r1Sample, "R1_Sample");
+    applyMissingValueDouble(r1Sample);
+    NcVar r1Blank = scope.addVar("R1_Blank", ncDouble, {exDim, sampleDim});
+    applyCfAttributes(r1Blank, "R1_Blank");
+    applyMissingValueDouble(r1Blank);
+    NcVar absSample = scope.addVar("AbsI1_Sample", ncDouble, {exDim, sampleDim});
+    applyCfAttributes(absSample, "AbsI1_Sample");
+    applyMissingValueDouble(absSample);
+    NcVar absBlank = scope.addVar("AbsI1_Blank", ncDouble, {exDim, sampleDim});
+    applyCfAttributes(absBlank, "AbsI1_Blank");
+    applyMissingValueDouble(absBlank);
+    NcVar s1DarkSample = scope.addVar("S1Dark_Sample", ncDouble, {emDim, sampleDim});
+    applyCfAttributes(s1DarkSample, "S1Dark_Sample");
+    applyMissingValueDouble(s1DarkSample);
+    NcVar s1DarkBlank = scope.addVar("S1Dark_Blank", ncDouble, {emDim, sampleDim});
+    applyCfAttributes(s1DarkBlank, "S1Dark_Blank");
+    applyMissingValueDouble(s1DarkBlank);
+
+    for (size_t i = 0; i < bucket.size(); i++)
+    {
+        const SampleRecord& r = *bucket[i];
+        if (r.S1Sample.size() == exCount * emCount)
+            s1Sample.putVar({0, 0, i}, {exCount, emCount, 1}, r.S1Sample.data());
+        if (r.S1Blank.size() == exCount * emCount)
+            s1Blank.putVar({0, 0, i}, {exCount, emCount, 1}, r.S1Blank.data());
+        writeSample1dVar(r1Sample, i, r.R1_Sample, exCount);
+        writeSample1dVar(r1Blank, i, r.R1_Blank, exCount);
+        writeSample1dVar(absSample, i, r.AbsI1_Sample, exCount);
+        writeSample1dVar(absBlank, i, r.AbsI1_Blank, exCount);
+        writeSample1dVar(s1DarkSample, i, r.S1Dark_Sample, emCount);
+        writeSample1dVar(s1DarkBlank, i, r.S1Dark_Blank, emCount);
+    }
+
+    NcVar r1DarkSampleVar = writeSampleDoubleVar(scope, sampleDim, "R1dark_Sample", bucket, &SampleRecord::R1dark_Sample);
+    applyCfAttributes(r1DarkSampleVar, "R1dark_Sample");
+    applyMissingValueDouble(r1DarkSampleVar);
+
+    NcVar r1DarkBlankVar = writeSampleDoubleVar(scope, sampleDim, "R1dark_Blank", bucket, &SampleRecord::R1dark_Blank);
+    applyCfAttributes(r1DarkBlankVar, "R1dark_Blank");
+    applyMissingValueDouble(r1DarkBlankVar);
+
+    NcVar absI1DarkSampleVar =
+        writeSampleDoubleVar(scope, sampleDim, "AbsI1dark_Sample", bucket, &SampleRecord::AbsI1dark_Sample);
+    applyCfAttributes(absI1DarkSampleVar, "AbsI1dark_Sample");
+    applyMissingValueDouble(absI1DarkSampleVar);
+
+    NcVar absI1DarkBlankVar =
+        writeSampleDoubleVar(scope, sampleDim, "AbsI1dark_Blank", bucket, &SampleRecord::AbsI1dark_Blank);
+    applyCfAttributes(absI1DarkBlankVar, "AbsI1dark_Blank");
+    applyMissingValueDouble(absI1DarkBlankVar);
+
+    // These four (plus data_identifier/ccd_adc_readout/ccd_gain below and
+    // ccd_xbin further down) come from the compressed Note report, not a
+    // spreadsheet - see kMissingValue's comment for why -9999/-9999.0
+    // actually appears in their data (not just declared as an attribute)
+    // whenever the Note extraction failed.
+    NcVar integrationTimeVar =
+        writeSampleDoubleVar(scope, sampleDim, "integration_time", bucket, &SampleRecord::integrationTime);
+    applyCfAttributes(integrationTimeVar, "integration_time");
+    applyMissingValueDouble(integrationTimeVar);
+
+    NcVar parkVar = writeSampleDoubleVar(scope, sampleDim, "park_wavelength_nm", bucket, &SampleRecord::parkWavelengthNm);
+    applyCfAttributes(parkVar, "park_wavelength_nm");
+    applyMissingValueDouble(parkVar);
+
+    NcVar gainFactorVar = writeSampleDoubleVar(scope, sampleDim, "ccd_gain_factor", bucket, &SampleRecord::ccdGainFactor);
+    applyCfAttributes(gainFactorVar, "ccd_gain_factor");
+    applyMissingValueDouble(gainFactorVar);
+
+    NcVar xbinVar = scope.addVar("ccd_xbin", ncInt, sampleDim);
+    applyCfAttributes(xbinVar, "ccd_xbin");
+    applyMissingValueInt(xbinVar);
+    for (size_t i = 0; i < bucket.size(); i++)
+    {
+        int value = bucket[i]->ccdXBin;
+        xbinVar.putVar({i}, {1}, &value);
+    }
+
+    NcVar workbookNameVar = writeSampleStringVar(scope, sampleDim, "workbook_name", bucket, &SampleRecord::workbookName);
+    applyCfAttributes(workbookNameVar, "workbook_name");
+    applyMissingValueString(workbookNameVar);
+
+    NcVar workbookShortNameVar =
+        writeSampleStringVar(scope, sampleDim, "workbook_short_name", bucket, &SampleRecord::workbookShortName);
+    applyCfAttributes(workbookShortNameVar, "workbook_short_name");
+    applyMissingValueString(workbookShortNameVar);
+
+    NcVar sourceOpjFileVar = writeSampleStringVar(scope, sampleDim, "source_opj_file", bucket, &SampleRecord::sourceOpjFile);
+    applyCfAttributes(sourceOpjFileVar, "source_opj_file");
+    applyMissingValueString(sourceOpjFileVar);
+
+    NcVar dataIdentifierVar = writeSampleStringVar(scope, sampleDim, "data_identifier", bucket, &SampleRecord::dataIdentifier);
+    applyCfAttributes(dataIdentifierVar, "data_identifier");
+    applyMissingValueString(dataIdentifierVar);
+
+    NcVar adcReadoutVar = writeSampleStringVar(scope, sampleDim, "ccd_adc_readout", bucket, &SampleRecord::ccdAdcReadout);
+    applyCfAttributes(adcReadoutVar, "ccd_adc_readout");
+    applyMissingValueString(adcReadoutVar);
+
+    NcVar ccdGainVar = writeSampleStringVar(scope, sampleDim, "ccd_gain", bucket, &SampleRecord::ccdGain);
+    applyCfAttributes(ccdGainVar, "ccd_gain");
+    applyMissingValueString(ccdGainVar);
+
+    NcVar experimentFileVar = writeSampleStringVar(scope, sampleDim, "experiment_file", bucket, &SampleRecord::experimentFile);
+    applyCfAttributes(experimentFileVar, "experiment_file");
+    applyMissingValueString(experimentFileVar);
+
+    NcVar creationTimeVar = writeSampleStringVar(scope, sampleDim, "creation_time", bucket, &SampleRecord::creationTime);
+    applyCfAttributes(creationTimeVar, "creation_time");
+    applyMissingValueString(creationTimeVar);
+
+    NcVar modificationTimeVar =
+        writeSampleStringVar(scope, sampleDim, "modification_time", bucket, &SampleRecord::modificationTime);
+    applyCfAttributes(modificationTimeVar, "modification_time");
+    applyMissingValueString(modificationTimeVar);
 }
 
 }  // namespace
@@ -1503,22 +1987,24 @@ int main(int argc, char* argv[])
 
     try
     {
-        NcFile nc(argv[2], NcFile::replace);
-        nc.putAtt("Conventions", "CF-1.8");
-        nc.putAtt("source_input", argv[1]);
-
-        // Every variable in this program is fully populated immediately
-        // after creation, so netCDF's default "pre-fill with a fill value,
-        // then overwrite" behavior is pure redundant I/O here - safe to
-        // disable unconditionally.
-        int oldFillMode;
-        nc.set_Fill(NC_NOFILL, &oldFillMode);
-
-        std::unordered_set<std::string> usedGroupNames;
+        // Phase 1: collect every exported sample from every input file
+        // into memory, in full, before anything is written to NetCDF -
+        // required because which samples share a measurement signature
+        // (and therefore how many NcGroups the output needs, if any)
+        // can't be known until every sample's axes/corrections are in
+        // hand. See organizeIntoBuckets()/writeBucket() below.
+        std::vector<SampleRecord> allSamples;
         unsigned int skippedBlankCount = 0;
         unsigned int skippedInvalidCount = 0;
         unsigned int skippedWrongTypeCount = 0;
-        //unsigned int sampleIndex = 0;
+
+        // One line per skipped/failed sample (and per file that failed to
+        // parse at all) - identifier, source .opj file, and reason - kept
+        // out of the console (see kept quiet on purpose above) but written
+        // into the output file's "comment" global attribute so a skip can
+        // still be tracked back to its exact sample and file for manual
+        // debugging in Origin. See the "comment" attribute written below.
+        std::vector<std::string> diagnosticLog;
 
         for (const auto& opjPath : opjFiles)
         {
@@ -1534,34 +2020,18 @@ int main(int argc, char* argv[])
             OriginFile opj(opjPathStr);
             if (!opj.parse())
             {
-                std::cerr << "  [error] could not parse '" << opjPathStr << "' - skipped\n";
+                diagnosticLog.push_back(opjPathStr + ": could not parse file - skipped");
                 continue;
             }
 
-            // Any standalone Note windows sitting in the project tree
-            // outside a workbook (opj.noteCount()/opj.note()) - e.g. a
-            // scratch note an operator left at the project level rather than
-            // on a specific sample's own Note page. Attached to every
-            // sample group from this file, since there's no single "right"
-            // group to put project-level text on.
-            std::vector<std::string> standaloneNotes;
-            for (unsigned int n = 0; n < opj.noteCount(); n++)
-            {
-                Origin::Note& note = opj.note(n);
-                if (!note.text.empty())
-                    standaloneNotes.push_back(note.name + ": " + note.text);
-            }
-
             // Decoded once per file (not per workbook) and matched to a
-            // workbook below by data identifier - see decodeCompressedNotes()
-            // above for why a fixed position can't be assumed.
+            // workbook below by structural byte-range containment - see
+            // findCompressedNoteForWindow().
             std::vector<CompressedNoteCandidate> compressedNotes =
                 decodeCompressedNotes(readRawFileBytes(opjPathStr));
 
             for (unsigned int i = 0; i < opj.excelCount(); i++)
             {
-                //auto sampleStart = std::chrono::steady_clock::now();
-
                 Origin::Excel& book = opj.excel(i);
 
                 std::string fullLabel = book.label.empty() ? book.name : book.label;
@@ -1581,9 +2051,9 @@ int main(int argc, char* argv[])
                 ExpSummaryFields expSummary = extractExpSummaryFields(book.rawPropertyBlock);
                 if (expSummary.expType != kRequiredExperimentType)
                 {
-                    std::cout << "  Skipping '" << sampleId << "' - Experiment Type is '"
-                              << (expSummary.expType.empty() ? "(none found)" : expSummary.expType)
-                              << "', not '" << kRequiredExperimentType << "'\n";
+                    diagnosticLog.push_back(opjPathStr + ": '" + sampleId + "' skipped - Experiment Type is '" +
+                                             (expSummary.expType.empty() ? "(none found)" : expSummary.expType) +
+                                             "', not '" + kRequiredExperimentType + "'");
                     skippedWrongTypeCount++;
                     continue;
                 }
@@ -1591,146 +2061,225 @@ int main(int argc, char* argv[])
                 ValidationResult validation = validateWorkbookAxes(book);
                 if (!validation.ok)
                 {
+                    std::string reasons;
+                    for (size_t r = 0; r < validation.reasons.size(); r++)
+                    {
+                        if (r > 0)
+                            reasons += "; ";
+                        reasons += validation.reasons[r];
+                    }
                     if (validation.isBlank)
                     {
-                        std::cout << "  Skipping '" << sampleId
-                                  << "' - no S1Sample sheet; this is a blank, not a sample\n";
+                        diagnosticLog.push_back(opjPathStr + ": '" + sampleId +
+                                                 "' skipped - no S1Sample sheet; this is a blank, not a sample");
                         skippedBlankCount++;
                     }
                     else
                     {
-                        std::cout << "  Skipping sample: " << sampleId
-                                  << " (failed consistency checks)\n";
+                        diagnosticLog.push_back(opjPathStr + ": '" + sampleId +
+                                                 "' skipped - failed consistency checks: " + reasons);
                         skippedInvalidCount++;
                     }
-                    for (auto& reason : validation.reasons)
-                        std::cerr << "    [skip] " << reason << "\n";
                     continue;
                 }
 
-                std::string baseName = safeName(sampleId);
-                std::string groupName = uniqueGroupName(usedGroupNames, baseName);
+                // Find this workbook's own Note by structural containment
+                // (see findCompressedNoteForWindow()) - guaranteed EM1 or
+                // null, never the absorbance-only report, so no separate
+                // "matched but not EEM" case to handle here. Used purely
+                // as a source of report-derived scalar fields below - not
+                // for identity, which comes exclusively from the
+                // workbook's own label (its LongName in Origin's own
+                // terms - see extractDataIdentifier()), honoring whatever
+                // the user has it set to right now, including any rename
+                // made after the fact in Origin's Project Explorer.
+                const CompressedNoteCandidate* match =
+                    findCompressedNoteForWindow(compressedNotes, book.dataStartOffset, book.dataEndOffset);
 
-                std::cout << "  Exporting sample: " << sampleId;
-                if (groupName != baseName)
-                    std::cout << " (name collision - stored as '" << groupName << "')";
-                std::cout << "\n";
-
-                NcGroup group = nc.addGroup(groupName);
-                group.putAtt("workbook_name", sampleId);
-                group.putAtt("workbook_short_name", book.name);
-                group.putAtt("source_opj_file", opjPathStr);
-
-                std::string dataIdentifier = extractDataIdentifier(fullLabel);
-                if (!dataIdentifier.empty())
-                    group.putAtt("data_identifier", dataIdentifier);
+                SampleRecord record = extractWorkbook(book);
+                record.workbookName = sampleId;
+                record.workbookShortName = book.name;
+                record.sourceOpjFile = opjPathStr;
+                record.dataIdentifier = extractDataIdentifier(fullLabel);
 
                 // Fields pulled from the compressed "GENERAL PARAMETERS:"
                 // report - integration time, Park wavelength (EM1's fixed
                 // park position), the CCD's X binning factor, ADC readout
-                // rate, and gain - each written only if the matching
+                // rate, and gain - each filled in only if the matching
                 // compressed note decoded far enough to reach it intact;
-                // see the "Compressed Note text" section above. As of the
-                // escape-scheme fix confirmed against a live Origin
-                // capture (see the runbook), all 5 known testdata files
-                // decode the full report cleanly, so in practice all five
-                // attributes should be present together or not at all -
-                // but still written independently/defensively in case a
-                // file not yet seen exercises something these didn't.
-                if (!dataIdentifier.empty())
+                // see the "Compressed Note text" section above.
+                if (match)
                 {
-                    for (const auto& candidate : compressedNotes)
+                    std::string integrationTimeText = extractIntegrationTimeText(match->decodedText);
+                    if (!integrationTimeText.empty())
                     {
-                        if (candidate.dataIdentifier != dataIdentifier)
-                            continue;
-
-                        std::string integrationTimeText = extractIntegrationTimeText(candidate.decodedText);
-                        if (!integrationTimeText.empty())
+                        try
                         {
-                            try
-                            {
-                                group.putAtt("integration_time", ncDouble, std::stod(integrationTimeText));
-                            }
-                            catch (const std::exception&)
-                            {
-                            }
+                            record.integrationTime = std::stod(integrationTimeText);
                         }
-
-                        std::string parkText = extractParkWavelengthText(candidate.decodedText);
-                        if (!parkText.empty())
+                        catch (const std::exception&)
                         {
-                            try
-                            {
-                                group.putAtt("park_wavelength_nm", ncDouble, std::stod(parkText));
-                            }
-                            catch (const std::exception&)
-                            {
-                            }
                         }
-
-                        std::string xBinText = extractXBinText(candidate.decodedText);
-                        if (!xBinText.empty())
-                        {
-                            try
-                            {
-                                group.putAtt("ccd_xbin", ncInt, std::stoi(xBinText));
-                            }
-                            catch (const std::exception&)
-                            {
-                            }
-                        }
-
-                        std::string adcText = extractLineAfterMarker(candidate.decodedText, "ADC: ");
-                        if (!adcText.empty())
-                            group.putAtt("ccd_adc_readout", adcText);
-
-                        std::string gainText = extractLineAfterMarker(candidate.decodedText, "Gain: ");
-                        if (!gainText.empty())
-                            group.putAtt("ccd_gain", gainText);
-
-                        if (!adcText.empty() && !gainText.empty())
-                            group.putAtt("ccd_gain_factor", ncDouble, ccdGainFactorFromReport(adcText, gainText));
-
-                        break;
                     }
+
+                    std::string parkText = extractParkWavelengthText(match->decodedText);
+                    if (!parkText.empty())
+                    {
+                        try
+                        {
+                            record.parkWavelengthNm = std::stod(parkText);
+                        }
+                        catch (const std::exception&)
+                        {
+                        }
+                    }
+
+                    std::string xBinText = extractXBinText(match->decodedText);
+                    if (!xBinText.empty())
+                    {
+                        try
+                        {
+                            record.ccdXBin = std::stoi(xBinText);
+                        }
+                        catch (const std::exception&)
+                        {
+                        }
+                    }
+
+                    std::string adcText = extractLineAfterMarker(match->decodedText, "ADC: ");
+                    if (!adcText.empty())
+                        record.ccdAdcReadout = adcText;
+
+                    std::string gainText = extractLineAfterMarker(match->decodedText, "Gain: ");
+                    if (!gainText.empty())
+                        record.ccdGain = gainText;
+
+                    if (!adcText.empty() && !gainText.empty())
+                        record.ccdGainFactor = ccdGainFactorFromReport(adcText, gainText);
                 }
 
                 std::string created = formatTimestampUtc(book.creationDate);
                 if (!created.empty())
-                    group.putAtt("creation_time", created);
+                    record.creationTime = created;
 
                 std::string modified = formatTimestampUtc(book.modificationDate);
                 if (!modified.empty())
-                    group.putAtt("modification_time", modified);
+                    record.modificationTime = modified;
 
                 // expSummary.expType was already used above to filter this
                 // sample in; expFilename is the other <ExpSummary> field
-                // worth keeping as its own typed attribute (see
-                // extractExpSummaryFields() above) - integration_time used
-                // to come from here too, but now comes from the compressed
-                // report instead (see the block above), which doesn't have
-                // this XML tag's floating-point representation noise.
+                // worth keeping (see extractExpSummaryFields() above) -
+                // integration_time used to come from here too, but now
+                // comes from the compressed report instead (see above),
+                // which doesn't have this XML tag's floating-point
+                // representation noise.
                 if (!expSummary.expFilename.empty())
-                    group.putAtt("experiment_file", expSummary.expFilename);
+                    record.experimentFile = expSummary.expFilename;
 
-                for (size_t n = 0; n < standaloneNotes.size(); n++)
-                    group.putAtt("project_note_" + std::to_string(n), standaloneNotes[n]);
-
-                exportWorkbook(group, book);
-
-                //auto sampleEnd = std::chrono::steady_clock::now();
-                //auto elapsedMs =
-                //    std::chrono::duration_cast<std::chrono::milliseconds>(sampleEnd - sampleStart).count();
-                //sampleIndex++;
-                //std::cout << "    (sample #" << sampleIndex << ", " << elapsedMs << " ms)\n";
+                allSamples.push_back(std::move(record));
             }
         }
+
+        // Two different .opj files can each contain a workbook with the
+        // same label/LongName - Origin's own "(NN)" auto-numbering only
+        // disambiguates duplicates *within* one project, so it has no way
+        // to catch (or warn about) the same identifier being reused in a
+        // separate file. That's different from the same identifier
+        // appearing twice *within* one file (e.g. "AO22268 (01)" and
+        // "AO22268 (02)"), which is Origin's own, already-handled record
+        // of a genuine, intentional repeat measurement in one session.
+        // So: tag every occurrence of a data_identifier that comes from a
+        // file other than the first file that used it. This is a
+        // FAIR-findability flag, not a correctness problem - the samples
+        // are still fully exported with their own real values, unique
+        // position along the data_identifier dimension, and everything
+        // else intact; the tag just tells a downstream reader "this
+        // identifier isn't unique across the dataset" so they can look
+        // closer if they want to.
+        {
+            std::unordered_map<std::string, std::string> firstFileForIdentifier;
+            for (SampleRecord& record : allSamples)
+            {
+                auto [it, inserted] = firstFileForIdentifier.try_emplace(record.dataIdentifier, record.sourceOpjFile);
+                if (!inserted && it->second != record.sourceOpjFile)
+                    record.dataIdentifier += "_duplicate";
+            }
+        }
+
+        // Phase 2: group the collected samples by exact measurement
+        // signature (excitation/emission/XCorrect/MCorrect/
+        // park_wavelength_nm/ccd_gain_factor/ccd_xbin/ccd_adc_readout/
+        // ccd_gain - see measurementSignatureKey()), largest group first
+        // (stable, so buckets of equal size keep their discovery order).
+        std::vector<std::vector<SampleRecord*>> buckets = organizeIntoBuckets(allSamples);
+        std::stable_sort(buckets.begin(), buckets.end(),
+                          [](const auto& a, const auto& b) { return a.size() > b.size(); });
+
+        // Phase 3: write. A single bucket means every sample shares one
+        // measurement configuration, so the output has no groups at all -
+        // everything goes straight into the file's root. More than one
+        // bucket means the input spans genuinely different configurations,
+        // so each gets its own group.
+        NcFile nc(argv[2], NcFile::replace);
+        nc.putAtt("Conventions", "CF-1.8");
+        nc.putAtt("source_input", argv[1]);
+        // Distinguishes this sample-indexed-variable layout from the
+        // earlier one-NetCDF-group-per-sample layout for any downstream
+        // reader that needs to tell them apart.
+        nc.putAtt("schema_version", "2");
+
+        // One line per skipped/failed sample or unparseable file - see
+        // diagnosticLog's comment above.
+        if (!diagnosticLog.empty())
+        {
+            std::string comment;
+            for (size_t n = 0; n < diagnosticLog.size(); n++)
+            {
+                if (n > 0)
+                    comment += "\n";
+                comment += diagnosticLog[n];
+            }
+            nc.putAtt("comment", comment);
+        }
+
+        // Every variable in this program is fully populated immediately
+        // after creation, so netCDF's default "pre-fill with a fill value,
+        // then overwrite" behavior is pure redundant I/O here - safe to
+        // disable unconditionally.
+        int oldFillMode;
+        nc.set_Fill(NC_NOFILL, &oldFillMode);
+
+        if (buckets.size() <= 1)
+        {
+            if (!buckets.empty())
+                writeBucket(nc, buckets[0]);
+        }
+        else
+        {
+            // Zero-padded to as many digits as the largest group number
+            // needs, so names still sort correctly as plain strings
+            // (measurement_type_02 before measurement_type_10).
+            size_t digits = std::to_string(buckets.size()).size();
+            for (size_t b = 0; b < buckets.size(); b++)
+            {
+                std::string number = std::to_string(b + 1);
+                number.insert(0, digits - std::min(digits, number.size()), '0');
+                NcGroup group = nc.addGroup("measurement_type_" + number);
+                writeBucket(group, buckets[b]);
+            }
+        }
+
+        std::string outputPath = fs::absolute(fs::path(argv[2])).string();
+
+        std::cout << "Wrote " << allSamples.size() << " sample(s) across " << buckets.size()
+                  << " measurement type(s) to " << outputPath << "\n";
 
         if (skippedBlankCount > 0 || skippedInvalidCount > 0 || skippedWrongTypeCount > 0)
         {
             std::cout << "Done (" << skippedBlankCount << " blank(s) skipped, "
                       << skippedInvalidCount << " sample(s) failed consistency checks, "
-                      << skippedWrongTypeCount << " sample(s) skipped for wrong Experiment Type)\n";
+                      << skippedWrongTypeCount << " sample(s) skipped for wrong Experiment Type - "
+                      << "see the output file's \"comment\" attribute for per-sample details)\n";
         }
         else
         {
