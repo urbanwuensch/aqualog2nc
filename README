@@ -17,9 +17,7 @@ Working:
 3. Settings mismatches are handled automatically: If settings are equal, the file stores in the root of the NetCDF, otherwise samples are grouped into batches.
 4. Blanks are detected and discarded (if left in OPJ as seperate samples)
 5. Incomplete (i.e. aborted) samples will be tossed, the routine checks dimenions and completeness.
-
-To do:
-1. The contents of the NetCDF file should been manually verfied on an example.
+6. Based on a sampling campaign consisting of ~200 samples, the fully processed EEMs and absorbance spectra (processed from NetCDF files using the drEEM toolbox) are within machine precision of the "HJY Export" reference.
 
 
 ## USAGE INSTRUCTIONS:
