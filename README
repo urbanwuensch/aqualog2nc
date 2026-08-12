@@ -5,7 +5,7 @@
 -----------------------------
 
 A few things to know:
-1. This project is heavily based on LLM-generated code (I don't know C++). But I do love open science, and this led me to want to "free" Aqualog data from the proprietary OPJ files to NetCDF.
+1. This project is entirely based on LLM-generated code (I don't know C++). But I do love open science, and this led me to want to "free" Aqualog data from the proprietary OPJ files to NetCDF.
 2. The project is not finished and not properly documented (as of August 2026). 
 3. The format of the NetCDF file might change slowly over time until v1.0 is released.
 4. Use at your own risk. Get involved to speed things up! (see to do).
@@ -13,14 +13,13 @@ A few things to know:
 
 Working:
 1. The tool converts EEM 3D + Absorbance sheets to NetCDF Attributes and Variables
-2. The folder is scanned for OPJ files automatically and any samples are aggregated into one NetCDF file
-3. Settings mismatches don't matter, samples are stored with their own coordinate variables
-4. The contents of the NetCDF file has been manually verfied on an example. The variables contained the same data has the original OPJ.
-5. Blanks are detected and discarded (if left in OPJ as seperate samples)
-6. Incomplete (i.e. aborted) samples will be tossed, the routine checks dimenions and completeness.
+2. The folder is scanned for OPJ and OGW files automatically and any samples are aggregated into one NetCDF file
+3. Settings mismatches are handled automatically: If settings are equal, the file stores in the root of the NetCDF, otherwise samples are grouped into batches.
+4. Blanks are detected and discarded (if left in OPJ as seperate samples)
+5. Incomplete (i.e. aborted) samples will be tossed, the routine checks dimenions and completeness.
 
 To do:
-1. "Note" sheet is not readable at the moment. Things like integration time and CCD binning remain stored there and cannot be grabbed.
+1. The contents of the NetCDF file should been manually verfied on an example.
 
 
 ## USAGE INSTRUCTIONS:
