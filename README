@@ -41,6 +41,117 @@ Working:
 3. Linux
 	I don't have a machine running Linux, so I could not produce a walk-through. Expect it to be similar to macOS.
 
+
+## WHAT THE TOOL DOES
+-----------------------------
+aqualog2nc reads Horiba AquaLog "3D Acquisition[EEM 3D CCD + Absorbance]"
+measurements straight out of Origin Pro's .opj/.ogw project files - no
+Origin Pro installation needed - and writes every sample it finds into a
+single NetCDF file. Give it one file or a whole folder; folders are
+scanned recursively for every .opj/.ogw file, and every sample from every
+file ends up in the same output.
+Two passes happen internally: first every sample in the input is read
+into memory (its excitation/emission axes, its raw EEM/absorbance data,
+and a handful of instrument settings pulled from the sample's own
+compressed report), then samples are grouped by whether they share the
+exact same measurement configuration before anything is written. Blanks
+(no real sample data) and incomplete/aborted samples are detected and
+skipped automatically - see the file's own "comment" attribute (below)
+for exactly which samples were skipped and why.
+Only the raw, unprocessed instrument output is exported - no blank
+subtraction, scatter removal, or other processing is applied. That's
+deliberate: this tool's job is to get the data out of the proprietary
+container intact, not to pre-process it for you. What you get is raw
+CCD/diode counts, not finished, corrected fluorescence or absorbance
+spectra: you still need to do your own processing (dark subtraction,
+applying XCorrect/MCorrect, blank subtraction, inner-filter-effect
+correction, Raman-unit calibration, scatter removal, etc.) to turn this
+raw data into fully corrected absorbance spectra and fluorescence EEM
+fingerprints for your samples.
+
+
+## STRUCTURE OF THE NETCDF FILE
+-----------------------------
+Samples that share the exact same excitation axis, emission axis,
+XCorrect, MCorrect, park wavelength, CCD gain factor, CCD pixel binning,
+and CCD gain/ADC settings are grouped together, since it would be
+wasteful to repeat identical axes/corrections for every single sample.
+Where all of this ends up depends on how many distinct measurement
+configurations the input actually contains:
+- If every sample in the input shares one configuration (the common
+  case for a single measurement campaign), there are no groups at all -
+  everything sits directly at the root of the NetCDF file.
+- If the input spans more than one configuration (e.g. you pointed the
+  tool at a folder covering more than one instrument setup), each
+  configuration gets its own group, named "measurement_type_1",
+  "measurement_type_2", etc. (numbered, zero-padded, largest group
+  first). Each group is a self-contained copy of the structure below.
+Either way, the structure inside root (or inside each group) is the
+same:
+Dimensions:
+  - data_identifier - one per sample in this bucket
+  - excitation, emission - the shared wavelength axes for every sample
+    in this bucket
+Variables indexed by (data_identifier, excitation, emission):
+  - S1Sample - raw, entirely uncorrected fluorescence observations
+    resulting from the excitation of the sample
+  - S1Blank - raw, entirely uncorrected fluorescence observations
+    resulting from the excitation of the blank
+Variables indexed by (data_identifier, excitation):
+  - R1_Sample, R1_Blank - intensity of the reference diode at every
+    excitation wavelength, during the sample/blank measurement
+  - AbsI1_Sample, AbsI1_Blank - raw, entirely uncorrected diode
+    intensity after the attenuation of light by the sample/blank
+Variables indexed by (data_identifier, emission):
+  - S1Dark_Sample, S1Dark_Blank - CCD detector signal under dark
+    conditions immediately prior to the sample/blank measurement
+  All of the above are raw instrument output - you still need to apply
+  your own corrections (see "WHAT THE TOOL DOES" above) to get a
+  corrected EEM or absorbance spectrum out of them.
+Variables indexed by (data_identifier) only - one value per sample:
+  - R1dark_Sample, R1dark_Blank - intensity of the reference diode
+    under dark conditions, immediately prior to the sample/blank
+    measurement
+  - AbsI1dark_Sample, AbsI1dark_Blank - intensity of the absorbance
+    diode under dark conditions, immediately prior to the sample/blank
+    measurement
+  - integration_time - integration time used for the measurement
+  - park_wavelength_nm - fixed centering value of the emission detector
+  - ccd_gain_factor - detector gain factor
+  - ccd_xbin - pixel binning of the emission detector
+  - ccd_adc_readout - gain setting 1; ccd_gain - gain setting 2
+  - data_identifier - data identifier as provided prior to measurement
+    (see "Sample identity" below)
+  - workbook_name - sample identifier as retrieved from the workbook
+    property; workbook_short_name - the short-identifier equivalent
+  - source_opj_file - the file from which the measurement was extracted
+  - experiment_file - the XML file from which the measurement was
+    orchestrated
+  - creation_time - date/time the measurement finished;
+    modification_time - date/time the data processing finished
+Variables indexed by their own axis only (shared, not per-sample):
+  - excitation, emission - the wavelength axes themselves (coordinate
+    variables)
+  - XCorrect (excitation) - instrument-specific excitation correction
+    factors for multiplication of signal
+  - MCorrect (emission) - instrument-specific emission correction
+    factors for multiplication of signal
+A missing value anywhere (e.g. a report-derived setting the tool
+couldn't find for a particular sample) is written as -9999 (or "-9999"
+for text fields), with a "missing_value" attribute declared on the
+variable per CF conventions - never silently left as some other
+placeholder.
+Every variable carries CF/ACDD-style attributes (standard_name,
+long_name, coverage_content_type, units, coordinates where applicable),
+and the file's global "comment" attribute records one line per sample
+that was skipped or failed a consistency check, with the reason and
+which .opj file it came from - check there first if a sample you
+expected to see is missing.
+### Sample identity
+data_identifier comes from the sample's own workbook name/label in
+Origin (exactly what you'd see in Origin's own Project Explorer, or
+what a LongName property lookup would give you) - not from anything
+
 ## GETTING INVOLVED
 -----------------------------
 
