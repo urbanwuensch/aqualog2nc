@@ -6,7 +6,7 @@ A few things to know:
 1. This project is entirely based on LLM-generated code (I don't know C++).
 2. Use at your own risk. Get in touch if you're missing a feature or find an inconsistency / bug.
 3. You may notice that the fully processed EEMs are not stored in the NetCDF files. This is an intentional choice. You can make deliberate rawdata corrections (ever had the misfortune of having incorrect correction factors?) before processing the data in FAIR research software such as drEEM.
-
+4. Much of this is based on liborigin. But this software adds functionality by being able to read out text in Note sheets by decompressing the binary text.
 
 ## WHAT THE TOOL DOES
 
