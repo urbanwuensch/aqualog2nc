@@ -1,32 +1,42 @@
 # aqualog2nc: Convert data in Origin Pro-type OPJ files containing Horiba AquaLog EEM+Absorbance to NetCDF files.
------------------------------
 
-## STATUS
------------------------------
+## A FEW THINGS TO KNOW
 
 A few things to know:
-1. This project is entirely based on LLM-generated code (I don't know C++). But I do love open science, and this led me to want to "free" Aqualog data from the proprietary OPJ files to NetCDF.
-2. The project is not finished and not properly documented (as of August 2026). 
-3. The format of the NetCDF file might change slowly over time until v1.0 is released.
-4. Use at your own risk. Get involved to speed things up! (see to do).
-5. Only unprocessed data is grabed and exported. You'll need to replicate the processing yourself (it's a feature, not a bug).
+1. This project is entirely based on LLM-generated code (I don't know C++).
+2. Use at your own risk. Get involved to speed things up! (see to do).
+3. You may notice that the fully processed EEMs are not stored in the NetCDF files. This is an intentional choice. You can make deliberate rawdata corrections (ever had the misfortune of having incorrect correction factors?) before processing the data in FAIR research software such as drEEM.
 
-Working:
-1. The tool converts EEM 3D + Absorbance sheets to NetCDF Attributes and Variables
-2. The folder is scanned for OPJ and OGW files automatically and any samples are aggregated into one NetCDF file
-3. Settings mismatches are handled automatically: If settings are equal, the file stores in the root of the NetCDF, otherwise samples are grouped into batches.
-4. Blanks are detected and discarded (if left in OPJ as seperate samples)
-5. Incomplete (i.e. aborted) samples will be tossed, the routine checks dimenions and completeness.
-6. Based on a sampling campaign consisting of ~200 samples, the fully processed EEMs and absorbance spectra (processed from NetCDF files using the drEEM toolbox) are within machine precision of the "HJY Export" reference.
 
+## WHAT THE TOOL DOES
+
+aqualog2nc reads Horiba AquaLog "3D Acquisition[EEM 3D CCD + Absorbance]"
+measurements straight out of Origin Pro's .opj/.ogw project files and writes 
+every sample it finds into a single NetCDF file. Give it one file or a whole folder; 
+and every sample from the file or folder ends up in the same output.
+Two passes happen internally: first every sample in the input is read
+into memory (its excitation/emission axes, its raw EEM/absorbance data,
+and a some of instrument settings pulled from the sample's own
+Note sheet). Then, samples are grouped by whether they share the
+exact same measurement configuration before anything is written. Blanks
+(no real sample data) and incomplete/aborted samples are detected and
+skipped automatically. The file's "comment" attribute details which 
+famples were skipped and provides a brief reasoning.
+Only the raw, unprocessed instrument output is exported. Meaning no blank
+subtraction, scatter removal, or other processing is applied. What you 
+get is raw CCD/diode counts. You still need to do your own processing (
+dark subtraction, applying XCorrect/MCorrect, blank subtraction, inner-filter-effect
+correction, Raman-unit calibration, scatter removal, etc.) to turn this
+raw data into fully corrected absorbance spectra and fluorescence EEM
+fingerprints for your samples. As of this writing, the drEEM toolbox can do
+this for you though.
 
 ## USAGE INSTRUCTIONS:
------------------------------
 
-1. macOS (Apple Silicon only):
+1. macOS (Apple Silicon only) & Linux
 	- Download aqualog2nc-macos-arm64
-	- Double click on aqualog2nc-macos-arm64 (do not move to trash when promted)
-	- Go to Settings -> Security & Privacy -> scroll down -> approve the application
+	- macOS only: Double click on aqualog2nc-macos-arm64 (do not move to trash when promted)
+	- macOS only: Go to Settings -> Security & Privacy -> scroll down -> approve the application
 	- Open terminal -> change to directory containing aqualog2nc-macos-arm64 -> run "chmod +x aqualog2nc-macos-arm64"  (making the software exectutable)
 	- Usage: ./aqualog2nc-macos-arm64 <input.opj | input_folder> output.nc (e.g. ./aqualog2nc-macos-arm64 /Users/wuensch/test.opj test.nc)
 	- NetCDF file will appear in the current directory of the terminal (not the directory with the OPJ files)
@@ -38,36 +48,9 @@ Working:
 	- Usage: ./aqualog2nc-windows-x64 <input.opj | input_folder> output.nc (e.g. ./aqualog2nc-windows-x64 "C:\Users\Public\Documents\Jobin Yvon\" test.nc)
 	- NetCDF file will appear in the current directory of the terminal (not the directory with the OPJ files)
 
-3. Linux
-	I don't have a machine running Linux, so I could not produce a walk-through. Expect it to be similar to macOS.
-
-
-## WHAT THE TOOL DOES
------------------------------
-aqualog2nc reads Horiba AquaLog "3D Acquisition[EEM 3D CCD + Absorbance]"
-measurements straight out of Origin Pro's .opj/.ogw project files - no
-Origin Pro installation needed - and writes every sample it finds into a
-single NetCDF file. Give it one file or a whole folder; folders are
-scanned recursively for every .opj/.ogw file, and every sample from every
-file ends up in the same output.
-Two passes happen internally: first every sample in the input is read
-into memory (its excitation/emission axes, its raw EEM/absorbance data,
-and a handful of instrument settings pulled from the sample's own
-compressed report), then samples are grouped by whether they share the
-exact same measurement configuration before anything is written. Blanks
-(no real sample data) and incomplete/aborted samples are detected and
-skipped automatically - see the file's own "comment" attribute (below)
-for exactly which samples were skipped and why.
-Only the raw, unprocessed instrument output is exported - no blank
-subtraction, scatter removal, or other processing is applied. That's
-deliberate: this tool's job is to get the data out of the proprietary
-container intact, not to pre-process it for you. What you get is raw
-CCD/diode counts, not finished, corrected fluorescence or absorbance
-spectra: you still need to do your own processing (dark subtraction,
-applying XCorrect/MCorrect, blank subtraction, inner-filter-effect
-correction, Raman-unit calibration, scatter removal, etc.) to turn this
-raw data into fully corrected absorbance spectra and fluorescence EEM
-fingerprints for your samples.
+3. drEEM-bundle
+	- Use ds=drEEMtoolbox.aqualogimport(folder). The toolbox automatically downloads the OS-specific version of aqualog2nc and does the hard work for you.
+	- Use [samples,blanks] = drEEMtoolbox.processHJYdata(ds) to get fully corrected samples, absorbance scans, and blanks! Done.
 
 
 ## STRUCTURE OF THE NETCDF FILE
