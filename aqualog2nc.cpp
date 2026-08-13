@@ -107,8 +107,10 @@
 // SAMPLE TIMESTAMPS
 // Origin::Excel inherits Window::creationDate / Window::modificationDate
 // (time_t), which Origin sets when the workbook is created/last modified.
-// These become the "creation_time"/"modification_time" ISO-8601 UTC
-// string variables, one value per sample.
+// These become the "creation_time"/"modification_time" ISO 8601:2004
+// extended-format string variables, one value per sample - see
+// formatTimestampLocal()'s own comment for why they carry this machine's
+// timezone offset rather than "Z"/UTC.
 //
 // SAMPLE IDENTITY
 // Origin::Window::name is the short internal identifier (e.g. "Book1") -
@@ -211,6 +213,7 @@
 #include <cctype>
 #include <chrono>
 #include <cmath>
+#include <cstdlib>
 #include <ctime>
 #include <filesystem>
 #include <fstream>
@@ -305,7 +308,7 @@ struct SampleRecord
     std::string dataIdentifier{kMissingValueString};  // workbook label/LongName's first line, "(NN)" counter kept - see extractDataIdentifier()
     std::string ccdAdcReadout{kMissingValueString}, ccdGain{kMissingValueString};  // e.g. "500 kHz G" / "ADC Gain / 1.00"
     std::string experimentFile{kMissingValueString};
-    std::string creationTime{kMissingValueString}, modificationTime{kMissingValueString};  // ISO-8601 UTC
+    std::string creationTime{kMissingValueString}, modificationTime{kMissingValueString};  // ISO 8601:2004 extended, this machine's tz offset
 };
 
 // ---------------------------------------------------------------------
@@ -947,18 +950,153 @@ std::string readRawFileBytes(const std::string& path)
     return ss.str();
 }
 
-// Formats a time_t as an ISO-8601 UTC string, e.g. "2024-03-14T09:41:02Z".
-// Returns an empty string for an unset/zero timestamp.
-std::string formatTimestampUtc(time_t t)
+// Portable current-timezone UTC offset (in seconds, positive = east of
+// UTC) for a given instant. Deliberately not tm_gmtoff (a BSD/glibc
+// extension - MSVC's CRT doesn't provide it, and this project ships a
+// Windows build via vcpkg): reinterpret t's own UTC broken-down fields
+// as if they were local time via mktime(), then diff against t. Uses
+// t's own calendar date (not "now") so DST resolves correctly for
+// whichever date is being formatted, per this machine's own timezone
+// rules.
+long localUtcOffsetSecondsFor(time_t t)
+{
+    std::tm utcTm = *std::gmtime(&t);  // single-threaded CLI tool - fine to use the non-reentrant form
+    utcTm.tm_isdst = -1;
+    time_t asIfLocal = std::mktime(&utcTm);
+    return static_cast<long>(std::difftime(t, asIfLocal));
+}
+
+// Formats a time_t (from Origin's own stored Julian-date value - see
+// doubleToPosixTime() in OriginAnyParser.h) as an ISO 8601:2004 extended
+// date-time string, e.g. "2024-03-14T09:41:02+02:00" - per ACDD's
+// date/time convention, which requires ISO 8601. Returns an empty
+// string for an unset/zero timestamp.
+//
+// Origin's stored timestamp carries no timezone of its own - it's the
+// acquiring computer's bare wall-clock reading (year/month/day/hour/
+// minute/second), run through a pure Julian-date-to-Unix-epoch formula
+// with no UTC normalization ever applied - so gmtime() on the resulting
+// time_t reproduces exactly those original wall-clock fields, not a
+// genuine UTC instant. There is therefore no way to know for certain
+// what timezone that reading was taken in. Rather than a "Z" suffix -
+// which would falsely claim a certainty about the timezone that doesn't
+// exist - this machine's own current timezone offset is appended as the
+// best available stand-in, per the user's explicit decision on how to
+// handle this ambiguity.
+std::string formatTimestampLocal(time_t t)
 {
     if (t <= 0)
         return "";
-    std::tm* tmUtc = std::gmtime(&t);  // single-threaded CLI tool - fine to use the non-reentrant form
-    if (!tmUtc)
+    std::tm* tmPtr = std::gmtime(&t);  // single-threaded CLI tool - fine to use the non-reentrant form
+    if (!tmPtr)
         return "";
+    std::tm recordedTm = *tmPtr;
+
+    long offsetSeconds = localUtcOffsetSecondsFor(t);
+    char sign = offsetSeconds < 0 ? '-' : '+';
+    long absOffset = std::labs(offsetSeconds);
+
     std::ostringstream oss;
-    oss << std::put_time(tmUtc, "%Y-%m-%dT%H:%M:%SZ");
+    oss << std::put_time(&recordedTm, "%Y-%m-%dT%H:%M:%S");
+    oss << sign << std::setw(2) << std::setfill('0') << (absOffset / 3600) << ':'
+        << std::setw(2) << std::setfill('0') << ((absOffset % 3600) / 60);
     return oss.str();
+}
+
+// Formats an elapsed duration (in seconds) as an ISO 8601:2004 duration
+// string, e.g. "P3DT2H30M15S" - for "time_coverage_duration", computed
+// as the plain difference between two time_t instants (not a
+// calendar-based duration), so this deliberately only ever uses the
+// D/H/M/S components, never Y/M(onths) - those are ambiguous for an
+// exact elapsed-seconds value (months/years vary in length) in a way
+// days/hours/minutes/seconds aren't. Zero-valued components are omitted
+// per the standard, except the special case of an exactly-zero duration
+// ("PT0S", ISO 8601's own convention - there's no shorter valid form).
+std::string formatIsoDuration(time_t totalSeconds)
+{
+    if (totalSeconds < 0)
+        totalSeconds = 0;
+    long days = static_cast<long>(totalSeconds / 86400);
+    long rem = static_cast<long>(totalSeconds % 86400);
+    long hours = rem / 3600;
+    rem %= 3600;
+    long minutes = rem / 60;
+    long secs = rem % 60;
+
+    std::ostringstream oss;
+    oss << "P";
+    if (days > 0)
+        oss << days << "D";
+    if (hours > 0 || minutes > 0 || secs > 0)
+    {
+        oss << "T";
+        if (hours > 0)
+            oss << hours << "H";
+        if (minutes > 0)
+            oss << minutes << "M";
+        if (secs > 0)
+            oss << secs << "S";
+    }
+    if (days == 0 && hours == 0 && minutes == 0 && secs == 0)
+        oss << "T0S";
+    return oss.str();
+}
+
+// One "history" entry: the instant it represents (for chronological
+// sorting - see the sort site near where "history" is written) and the
+// fully-formatted line text. sortKey is deliberately not derived from
+// the formatted text (comparing ISO 8601 strings with different UTC
+// offsets - e.g. a winter +01:00 measurement timestamp next to a summer
+// +02:00 processing timestamp - is not guaranteed to agree with true
+// chronological order), so every entry carries its own raw time_t.
+struct DiagnosticEntry
+{
+    time_t sortKey;
+    std::string line;
+};
+
+// Appends one entry to the diagnostic log that ends up in the output
+// file's "history" attribute, prefixed with the current date/time and
+// this program's name - per the NetCDF Users Guide's "history"
+// convention (the one both CF §2.6.2 and ACDD point to): a line for
+// each invocation/action, each carrying its own date/time and program
+// name. See logInvocation() for the one line that also carries the
+// user name and command arguments, satisfying the rest of that
+// convention without repeating them on every single line. Sorted by
+// "now" at the time this was called - the right sort key for anything
+// this program logs about its own actions (as opposed to a fact about
+// the data itself - see the "completed measurement" entries in main(),
+// which use their own measurement's completion time instead, so they
+// sort chronologically before this program's own, much later,
+// processing-time entries).
+void logDiagnostic(std::vector<DiagnosticEntry>& diagnosticLog, const std::string& message)
+{
+    time_t now = std::time(nullptr);
+    diagnosticLog.push_back({now, formatTimestampLocal(now) + " aqualog2nc: " + message});
+}
+
+// Portable current username lookup (POSIX sets USER, Windows sets
+// USERNAME) - used once, for the invocation line logInvocation() writes.
+std::string currentUsername()
+{
+    const char* user = std::getenv("USER");
+    if (!user || !*user)
+        user = std::getenv("USERNAME");
+    return (user && *user) ? user : "unknown";
+}
+
+// The one "history" line that on its own satisfies the full NetCDF
+// Users Guide convention - date, time, user name, program name, and
+// command arguments - so every other logDiagnostic() entry only needs
+// its own date/time and program name, since they're all part of this
+// same invocation.
+void logInvocation(std::vector<DiagnosticEntry>& diagnosticLog, int argc, char** argv)
+{
+    time_t now = std::time(nullptr);
+    std::string line = formatTimestampLocal(now) + " " + currentUsername() + " aqualog2nc";
+    for (int i = 1; i < argc; i++)
+        line += " " + std::string(argv[i]);
+    diagnosticLog.push_back({now, line});
 }
 
 Origin::SpreadSheet* findSheet(Origin::Excel& book, const std::string& normalizedKey)
@@ -1998,29 +2136,50 @@ int main(int argc, char* argv[])
         unsigned int skippedInvalidCount = 0;
         unsigned int skippedWrongTypeCount = 0;
 
-        // One line per skipped/failed sample (and per file that failed to
-        // parse at all) - identifier, source .opj file, and reason - kept
-        // out of the console (see kept quiet on purpose above) but written
-        // into the output file's "comment" global attribute so a skip can
-        // still be tracked back to its exact sample and file for manual
-        // debugging in Origin. See the "comment" attribute written below.
-        std::vector<std::string> diagnosticLog;
+        // Latest modification_time across every exported sample - tracked
+        // as the raw time_t (not the already-formatted string) so the
+        // comparison is a plain integer comparison, unaffected by any
+        // timezone-offset differences between samples recorded in
+        // different DST seasons (see formatTimestampLocal()'s comment).
+        // Feeds the "date_modified"/"date_metadata_modified" global
+        // attributes below, per the spreadsheet's instruction.
+        time_t maxModificationTime = 0;
+
+        // Earliest/latest creation_time (i.e. when a measurement itself
+        // finished, not when it was later post-processed) across every
+        // exported sample - feeds "time_coverage_start"/"_end"/
+        // "_duration" below, same raw-time_t tracking rationale as above.
+        time_t minCreationTime = 0;
+        time_t maxCreationTime = 0;
+
+        // Full audit trail of this run - every file read, every accepted
+        // sample, every skip/failure, the grouping decision, and the
+        // final summary - kept out of the console (see kept quiet on
+        // purpose above, for the per-file/per-sample lines) but written
+        // in full into the output file's "history" global attribute (per
+        // the NetCDF Users Guide convention CF §2.6.2/ACDD both point
+        // to). See logDiagnostic()/logInvocation() and the "history"
+        // attribute written near the end of this function.
+        std::vector<DiagnosticEntry> diagnosticLog;
+        logInvocation(diagnosticLog, argc, argv);
 
         for (const auto& opjPath : opjFiles)
         {
             std::string opjPathStr = opjPath.string();
+            logDiagnostic(diagnosticLog, "reading " + opjPathStr);
             // .ogw holds exactly one workbook, so the "Exporting sample: "
             // line below already identifies it - an extra "Reading ..."
-            // line ahead of it is just noise when there are many .ogw
-            // files (one per sample) rather than a handful of multi-sample
-            // .opj projects.
+            // console line ahead of it is just noise when there are many
+            // .ogw files (one per sample) rather than a handful of
+            // multi-sample .opj projects. (Still logged above regardless
+            // of extension - only the console print is suppressed.)
             if (lowerExtension(opjPath) != ".ogw")
                 std::cout << "Reading " << opjPathStr << "\n";
 
             OriginFile opj(opjPathStr);
             if (!opj.parse())
             {
-                diagnosticLog.push_back(opjPathStr + ": could not parse file - skipped");
+                logDiagnostic(diagnosticLog, opjPathStr + ": could not parse file - skipped");
                 continue;
             }
 
@@ -2051,7 +2210,7 @@ int main(int argc, char* argv[])
                 ExpSummaryFields expSummary = extractExpSummaryFields(book.rawPropertyBlock);
                 if (expSummary.expType != kRequiredExperimentType)
                 {
-                    diagnosticLog.push_back(opjPathStr + ": '" + sampleId + "' skipped - Experiment Type is '" +
+                    logDiagnostic(diagnosticLog, opjPathStr + ": '" + sampleId + "' skipped - Experiment Type is '" +
                                              (expSummary.expType.empty() ? "(none found)" : expSummary.expType) +
                                              "', not '" + kRequiredExperimentType + "'");
                     skippedWrongTypeCount++;
@@ -2070,13 +2229,13 @@ int main(int argc, char* argv[])
                     }
                     if (validation.isBlank)
                     {
-                        diagnosticLog.push_back(opjPathStr + ": '" + sampleId +
+                        logDiagnostic(diagnosticLog, opjPathStr + ": '" + sampleId +
                                                  "' skipped - no S1Sample sheet; this is a blank, not a sample");
                         skippedBlankCount++;
                     }
                     else
                     {
-                        diagnosticLog.push_back(opjPathStr + ": '" + sampleId +
+                        logDiagnostic(diagnosticLog, opjPathStr + ": '" + sampleId +
                                                  "' skipped - failed consistency checks: " + reasons);
                         skippedInvalidCount++;
                     }
@@ -2158,13 +2317,21 @@ int main(int argc, char* argv[])
                         record.ccdGainFactor = ccdGainFactorFromReport(adcText, gainText);
                 }
 
-                std::string created = formatTimestampUtc(book.creationDate);
+                std::string created = formatTimestampLocal(book.creationDate);
                 if (!created.empty())
+                {
                     record.creationTime = created;
+                    if (minCreationTime == 0 || book.creationDate < minCreationTime)
+                        minCreationTime = book.creationDate;
+                    if (book.creationDate > maxCreationTime)
+                        maxCreationTime = book.creationDate;
+                }
 
-                std::string modified = formatTimestampUtc(book.modificationDate);
+                std::string modified = formatTimestampLocal(book.modificationDate);
                 if (!modified.empty())
                     record.modificationTime = modified;
+                if (book.modificationDate > maxModificationTime)
+                    maxModificationTime = book.modificationDate;
 
                 // expSummary.expType was already used above to filter this
                 // sample in; expFilename is the other <ExpSummary> field
@@ -2176,6 +2343,25 @@ int main(int argc, char* argv[])
                 if (!expSummary.expFilename.empty())
                     record.experimentFile = expSummary.expFilename;
 
+                // A fact about the sample itself, not an action this
+                // program took - so it's dated (and sorted, see the
+                // "history" sort site) by the measurement's own
+                // completion time (book.creationDate), not "now" like
+                // every other history line. Measurement times are
+                // normally years before any given run of this program,
+                // so sorting the whole log chronologically puts every
+                // one of these first, ahead of anything this run itself
+                // did - which is the point: it's the more fundamental
+                // fact.
+                std::string completedAt = formatTimestampLocal(book.creationDate);
+                if (!completedAt.empty())
+                {
+                    diagnosticLog.push_back(
+                        {book.creationDate, completedAt + ": " + record.dataIdentifier + " completed measurement"});
+                }
+
+                logDiagnostic(diagnosticLog,
+                              "accepted sample '" + record.dataIdentifier + "' from " + opjPathStr);
                 allSamples.push_back(std::move(record));
             }
         }
@@ -2215,31 +2401,87 @@ int main(int argc, char* argv[])
         std::stable_sort(buckets.begin(), buckets.end(),
                           [](const auto& a, const auto& b) { return a.size() > b.size(); });
 
+        logDiagnostic(diagnosticLog,
+                       "grouping check: compared excitation, emission, XCorrect, MCorrect, "
+                       "park_wavelength_nm, ccd_gain_factor, ccd_xbin, ccd_adc_readout, ccd_gain "
+                       "(exact match required) across all " + std::to_string(allSamples.size()) +
+                       " accepted sample(s)");
+        if (buckets.size() <= 1)
+        {
+            logDiagnostic(diagnosticLog, "grouping result: all accepted samples share the same "
+                                          "measurement configuration - no groups created");
+        }
+        else
+        {
+            std::string sizes;
+            for (size_t b = 0; b < buckets.size(); b++)
+            {
+                if (b > 0)
+                    sizes += ", ";
+                sizes += std::to_string(buckets[b].size());
+            }
+            logDiagnostic(diagnosticLog,
+                           "grouping result: " + std::to_string(buckets.size()) +
+                           " distinct measurement configuration(s) found - samples grouped into " +
+                           std::to_string(buckets.size()) + " measurement_type_N group(s) (sizes: " +
+                           sizes + ")");
+        }
+
         // Phase 3: write. A single bucket means every sample shares one
         // measurement configuration, so the output has no groups at all -
         // everything goes straight into the file's root. More than one
         // bucket means the input spans genuinely different configurations,
         // so each gets its own group.
         NcFile nc(argv[2], NcFile::replace);
-        nc.putAtt("Conventions", "CF-1.8");
+        nc.putAtt("Conventions", "CF-1.13, ACDD-1.3");
         nc.putAtt("source_input", argv[1]);
-        // Distinguishes this sample-indexed-variable layout from the
-        // earlier one-NetCDF-group-per-sample layout for any downstream
-        // reader that needs to tell them apart.
-        nc.putAtt("schema_version", "2");
 
-        // One line per skipped/failed sample or unparseable file - see
-        // diagnosticLog's comment above.
-        if (!diagnosticLog.empty())
+        // ACDD discovery/provenance attributes, per "netcdf variable
+        // attributes.xlsx" 's "Global attributes" sheet.
+        nc.putAtt("keywords", "FDOM, CDOM, fluorescence, absorbance, excitation-emission matrix, Horiba, Aqualog");
+        nc.putAtt("summary", "Rawdata exported from proprietary OPJ or OGW files created by HORIBA Aqualog spectrofluorometers");
+        nc.putAtt("title", "UV-Vis absorbance and fluorescence spectra");
+        nc.putAtt("instrument", "Horiba Aqualog");
+        nc.putAtt("instrument_vocabulary", "NERC Vocabulary Server L22");
+        nc.putAtt("standard_name_vocabulary", "CF Standard Name Table v94");
+        nc.putAtt("source", "physicalMeasurement");
+        nc.putAtt("cdm_data_type", "grid");
+        nc.putAtt("comment", "This file was produced using the C++ tool aqualog2nc: https://github.com/urbanwuensch/aqualog2nc");
+
+        // date_created/date_issued: both this export's own wall-clock
+        // time - genuinely known (unlike a sample's own creation/
+        // modification time, this one really is "right now, on this
+        // machine"), so no offset ambiguity here at all. Same instant
+        // for both, captured once.
+        std::string exportTime = formatTimestampLocal(std::time(nullptr));
+        nc.putAtt("date_created", exportTime);
+        nc.putAtt("date_issued", exportTime);
+
+        // date_modified/date_metadata_modified: per the spreadsheet, both
+        // use the latest modification_time seen across every exported
+        // sample (maxModificationTime, tracked as a raw time_t during
+        // Phase 1 - see its own comment for why not the formatted
+        // strings). Left unset if no sample had a valid modification
+        // date at all.
+        if (maxModificationTime > 0)
         {
-            std::string comment;
-            for (size_t n = 0; n < diagnosticLog.size(); n++)
-            {
-                if (n > 0)
-                    comment += "\n";
-                comment += diagnosticLog[n];
-            }
-            nc.putAtt("comment", comment);
+            std::string latestModified = formatTimestampLocal(maxModificationTime);
+            nc.putAtt("date_modified", latestModified);
+            nc.putAtt("date_metadata_modified", latestModified);
+        }
+
+        // time_coverage_start/_end: earliest/latest creation_time (i.e.
+        // when a measurement itself finished) across every exported
+        // sample - minCreationTime/maxCreationTime, tracked the same way
+        // as maxModificationTime above. _duration is the plain elapsed
+        // time between the two, not a calendar-based duration (see
+        // formatIsoDuration()'s own comment). All three left unset if no
+        // sample had a valid creation date at all.
+        if (minCreationTime > 0 && maxCreationTime > 0)
+        {
+            nc.putAtt("time_coverage_start", formatTimestampLocal(minCreationTime));
+            nc.putAtt("time_coverage_end", formatTimestampLocal(maxCreationTime));
+            nc.putAtt("time_coverage_duration", formatIsoDuration(maxCreationTime - minCreationTime));
         }
 
         // Every variable in this program is fully populated immediately
@@ -2271,6 +2513,51 @@ int main(int argc, char* argv[])
 
         std::string outputPath = fs::absolute(fs::path(argv[2])).string();
 
+        logDiagnostic(diagnosticLog,
+                       "wrote " + std::to_string(allSamples.size()) + " sample(s) across " +
+                       std::to_string(buckets.size()) + " measurement type(s) to " + outputPath);
+        if (skippedBlankCount > 0 || skippedInvalidCount > 0 || skippedWrongTypeCount > 0)
+        {
+            logDiagnostic(diagnosticLog,
+                           "finished (" + std::to_string(skippedBlankCount) + " blank(s) skipped, " +
+                           std::to_string(skippedInvalidCount) + " sample(s) failed consistency checks, " +
+                           std::to_string(skippedWrongTypeCount) + " sample(s) skipped for wrong Experiment Type)");
+        }
+        else
+        {
+            logDiagnostic(diagnosticLog, "finished");
+        }
+
+        // Full audit trail of this run - invocation, every file read,
+        // every accepted sample, every skip/failure, the grouping
+        // decision, and this final summary - one timestamped line per
+        // action, per the NetCDF Users Guide "history" convention (see
+        // logDiagnostic()/logInvocation() above). Written after all data
+        // is already in the file, so it can include this run's own
+        // outcome, not just what led up to it.
+        //
+        // Sorted chronologically by each entry's own instant (sortKey),
+        // not left in collection order - this is what puts every
+        // "completed measurement" entry (dated by the actual measurement
+        // time, typically years earlier) ahead of this run's own
+        // processing entries (all dated "now"). Stable, so entries that
+        // share an instant (e.g. two files read within the same second)
+        // keep their original relative order.
+        {
+            std::stable_sort(diagnosticLog.begin(), diagnosticLog.end(),
+                              [](const DiagnosticEntry& a, const DiagnosticEntry& b) {
+                                  return a.sortKey < b.sortKey;
+                              });
+            std::string history;
+            for (size_t n = 0; n < diagnosticLog.size(); n++)
+            {
+                if (n > 0)
+                    history += "\n";
+                history += diagnosticLog[n].line;
+            }
+            nc.putAtt("history", history);
+        }
+
         std::cout << "Wrote " << allSamples.size() << " sample(s) across " << buckets.size()
                   << " measurement type(s) to " << outputPath << "\n";
 
@@ -2279,7 +2566,7 @@ int main(int argc, char* argv[])
             std::cout << "Done (" << skippedBlankCount << " blank(s) skipped, "
                       << skippedInvalidCount << " sample(s) failed consistency checks, "
                       << skippedWrongTypeCount << " sample(s) skipped for wrong Experiment Type - "
-                      << "see the output file's \"comment\" attribute for per-sample details)\n";
+                      << "see the output file's \"history\" attribute for per-sample details)\n";
         }
         else
         {
