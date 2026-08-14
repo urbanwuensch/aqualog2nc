@@ -11,25 +11,35 @@ A few things to know:
 ## WHAT THE TOOL DOES
 
 aqualog2nc reads Horiba AquaLog "3D Acquisition[EEM 3D CCD + Absorbance]"
-measurements straight out of Origin Pro's .opj/.ogw project files and writes 
-every sample it finds into a single NetCDF file. Give it one file or a whole folder; 
-and every sample from the file or folder ends up in the same output.
-Two passes happen internally: first every sample in the input is read
-into memory (its excitation/emission axes, its raw EEM/absorbance data,
-and a some of instrument settings pulled from the sample's own
-Note sheet). Then, samples are grouped by whether they share the
-exact same measurement configuration before anything is written. Blanks
-(no real sample data) and incomplete/aborted samples are detected and
-skipped automatically. The file's "comment" attribute details which 
-famples were skipped and provides a brief reasoning.
+measurements straight out of Origin Pro's .opj/.ogw project files and writes
+every sample it finds into a single NetCDF file. Give it one file or a whole
+folder; every sample from the file or folder ends up in the same output.
+
+Two passes happen internally: first every sample in the input is read into
+memory (its excitation/emission axes, its raw EEM/absorbance data, and some
+instrument settings pulled from the sample's own Note sheet). Then samples
+are grouped by whether they share the exact same measurement configuration
+before anything is written. Blanks (no real sample data) and
+incomplete/aborted samples are detected and skipped automatically. The
+file's "history" attribute records a full, timestamped audit trail of the
+run - every file read, every sample accepted, every sample skipped (with a
+reason), when each measurement itself actually completed, and a final
+summary - check there first if a sample you expected to see is missing.
+
 Only the raw, unprocessed instrument output is exported. Meaning no blank
-subtraction, scatter removal, or other processing is applied. What you 
-get is raw CCD/diode counts. You still need to do your own processing (
-dark subtraction, applying XCorrect/MCorrect, blank subtraction, inner-filter-effect
-correction, Raman-unit calibration, scatter removal, etc.) to turn this
-raw data into fully corrected absorbance spectra and fluorescence EEM
-fingerprints for your samples. As of this writing, the drEEM toolbox can do
-this for you though.
+subtraction, scatter removal, or other processing is applied. What you get
+is raw CCD/diode counts. You still need to do your own processing (dark
+subtraction, applying XCorrect/MCorrect, blank subtraction,
+inner-filter-effect correction, Raman-unit calibration, scatter removal,
+etc.) to turn this raw data into fully corrected absorbance spectra and
+fluorescence EEM fingerprints for your samples. As of this writing, the
+drEEM toolbox can do this for you though.
+
+The output file also carries standard ACDD/CF discovery metadata (title,
+summary, keywords, instrument, Conventions, creation/processing dates, the
+time span the measurements cover, and a version tag for the aqualog2nc
+release that produced it) - useful if you're archiving the file somewhere
+that indexes on that kind of metadata.
 
 ## USAGE INSTRUCTIONS:
 
@@ -72,26 +82,37 @@ configurations the input actually contains:
 Either way, the structure inside root (or inside each group) is the
 same:
 Dimensions:
-  - data_identifier - one per sample in this bucket
+  - data_identifier_i - one per sample in this bucket
   - excitation, emission - the shared wavelength axes for every sample
     in this bucket
-Variables indexed by (data_identifier, excitation, emission):
+Variables indexed by (data_identifier_i, excitation, emission):
   - S1Sample - raw, entirely uncorrected fluorescence observations
     resulting from the excitation of the sample
   - S1Blank - raw, entirely uncorrected fluorescence observations
     resulting from the excitation of the blank
-Variables indexed by (data_identifier, excitation):
+Variables indexed by (data_identifier_i, excitation):
   - R1_Sample, R1_Blank - intensity of the reference diode at every
     excitation wavelength, during the sample/blank measurement
   - AbsI1_Sample, AbsI1_Blank - raw, entirely uncorrected diode
     intensity after the attenuation of light by the sample/blank
-Variables indexed by (data_identifier, emission):
+Variables indexed by (data_identifier_i, emission):
   - S1Dark_Sample, S1Dark_Blank - CCD detector signal under dark
     conditions immediately prior to the sample/blank measurement
   All of the above are raw instrument output - you still need to apply
   your own corrections (see "WHAT THE TOOL DOES" above) to get a
   corrected EEM or absorbance spectrum out of them.
-Variables indexed by (data_identifier) only - one value per sample:
+Variables indexed by (data_identifier_i) only - one value per sample:
+  - data_identifier_i - the actual coordinate variable for this
+    dimension: a plain, monotonically increasing integer (1, 2, 3, ...)
+    with no other meaning, present because some strict CF compliance
+    checkers require a dimension's coordinate variable to hold
+    monotonic values, which the human-readable identifier below can't
+    guarantee.
+  - data_identifier - the sample's own identifier, exactly as it
+    appears in Origin's workbook browser (see "Sample identity" below).
+    Not guaranteed unique - two samples can legitimately share one - so
+    treat data_identifier_i as the reliable way to index a specific
+    sample, and data_identifier as the human-readable label for it.
   - R1dark_Sample, R1dark_Blank - intensity of the reference diode
     under dark conditions, immediately prior to the sample/blank
     measurement
@@ -103,8 +124,6 @@ Variables indexed by (data_identifier) only - one value per sample:
   - ccd_gain_factor - detector gain factor
   - ccd_xbin - pixel binning of the emission detector
   - ccd_adc_readout - gain setting 1; ccd_gain - gain setting 2
-  - data_identifier - data identifier as provided prior to measurement
-    (see "Sample identity" below)
   - workbook_name - sample identifier as retrieved from the workbook
     property; workbook_short_name - the short-identifier equivalent
   - source_opj_file - the file from which the measurement was extracted
@@ -125,15 +144,33 @@ for text fields), with a "missing_value" attribute declared on the
 variable per CF conventions - never silently left as some other
 placeholder.
 Every variable carries CF/ACDD-style attributes (standard_name,
-long_name, coverage_content_type, units, coordinates where applicable),
-and the file's global "comment" attribute records one line per sample
-that was skipped or failed a consistency check, with the reason and
-which .opj file it came from - check there first if a sample you
-expected to see is missing.
+long_name, coverage_content_type, units, coordinates where applicable).
+The file's global "history" attribute is a full, timestamped audit
+trail of the run that produced it: the exact command invoked, every
+input file read, every sample accepted or skipped (with a reason and
+which .opj file it came from), when each accepted sample's measurement
+actually finished, how the grouping decision above was made, and a
+final summary - all entries sorted chronologically, so a sample's own
+measurement time appears ahead of anything this run itself did. Check
+it first if a sample you expected to see is missing, or if you want a
+record of exactly what a given export run did.
 ### Sample identity
 data_identifier comes from the sample's own workbook name/label in
 Origin (exactly what you'd see in Origin's own Project Explorer, or
 what a LongName property lookup would give you) - not from anything
+inside the compressed Note sheet, and not cross-checked against it
+either. Whatever the workbook is currently named is trusted as-is,
+including a rename made after the fact. Because of this,
+data_identifier is not guaranteed unique: two samples can legitimately
+share one (e.g. a genuine repeat measurement, or an operator reusing
+the same identifier by mistake) - they're told apart by their position
+along the data_identifier_i dimension, not by the string itself. One
+exception is flagged automatically: if the same data_identifier turns
+up in two different source .opj files - which Origin itself has no way
+to catch, since it only ever sees one project at a time - every
+occurrence after the first file that used it gets "_duplicate"
+appended. This is an informational flag for findability, not a
+correctness gate; the sample's data is exported normally either way.
 
 ## GETTING INVOLVED
 -----------------------------
