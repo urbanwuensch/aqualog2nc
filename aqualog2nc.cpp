@@ -16,8 +16,8 @@
 // MCorrect/park_wavelength_nm/ccd_gain_factor/ccd_xbin/ccd_adc_readout/
 // ccd_gain), then each group is written. A sample's own spectral data and
 // what used to be its own per-sample scalar attributes are now variables
-// indexed by a "data_identifier" dimension shared with everything else in
-// its group - see SampleRecord and writeBucket() below.
+// indexed by a "data_identifier_i" dimension shared with everything else
+// in its group - see SampleRecord and writeBucket() below.
 //
 // Dispatches on worksheet *type* instead of treating every sheet as a
 // generic 2D matrix - mirrors the switch(sheetnames{k}) structure in
@@ -41,12 +41,17 @@
 // within a bucket's scope every
 // per-sample quantity - both the spectral arrays (S1Sample, R1_Blank, ...)
 // and what used to be scalar attributes (integration_time, R1dark_Sample,
-// data_identifier, ...) - is a variable indexed by a "data_identifier"
-// dimension, not an attribute. data_identifier doubles as that
-// dimension's own coordinate variable, the same way excitation/emission
-// are for theirs. See SampleRecord (one per exported sample, holds
-// everything before it's bucketed) and writeBucket() (writes one bucket's
-// worth of variables, one indexed slice per sample).
+// data_identifier, ...) - is a variable indexed by a "data_identifier_i"
+// dimension, not an attribute. data_identifier_i is a plain monotonically
+// increasing integer index and doubles as that dimension's own CF
+// coordinate variable, the same way excitation/emission are for theirs -
+// data_identifier (the human-readable string) deliberately does not fill
+// that role, since it's allowed to repeat across samples and a CF
+// coordinate variable must be strictly monotonic (see kCfAttributes'
+// comment on data_identifier_i for why). See SampleRecord (one per
+// exported sample, holds everything before it's bucketed) and
+// writeBucket() (writes one bucket's worth of variables, one indexed
+// slice per sample).
 //
 // PADDED-ROW HANDLING
 // Origin sometimes reserves more rows in a spreadsheet column than an
@@ -134,7 +139,8 @@
 // no longer identifies an individual sample (see "SAMPLE-INDEXED SCHEMA"
 // above), there's no need for data_identifier to be unique - two samples
 // can freely share the same one; they're told apart by their position
-// along the "data_identifier" dimension, not by the string value itself.
+// along the "data_identifier_i" dimension, not by the string value
+// itself.
 //
 // One exception is flagged, not silently accepted: two *different* input
 // .opj files can independently contain a workbook with the same label
@@ -1866,40 +1872,57 @@ const std::unordered_map<std::string, CfAttributes> kCfAttributes = {
     {"S1Dark_Blank", {nullptr, "CCD detector signal under dark conditions immediately prior to blank measurement",
                        "physicalMeasurement", "1", "data_identifier emission"}},
     {"R1dark_Sample", {nullptr, "Intensity of the reference diode under dark conditions immediately prior to sample measurement",
-                        "physicalMeasurement", "1", "data_identifier"}},
+                        "physicalMeasurement", "1", "data_identifier_i"}},
     {"R1dark_Blank", {nullptr, "Intensity of the reference diode under dark conditions immediately prior to blank measurement",
-                       "physicalMeasurement", "1", "data_identifier"}},
+                       "physicalMeasurement", "1", "data_identifier_i"}},
     {"AbsI1dark_Sample", {nullptr, "Intensity of the absorbance diode under dark conditions immediately prior to sample measurement",
-                           "physicalMeasurement", "1", "data_identifier"}},
+                           "physicalMeasurement", "1", "data_identifier_i"}},
     {"AbsI1dark_Blank", {nullptr, "Intensity of the absorbance diode under dark conditions immediately prior to blank measurement",
-                          "physicalMeasurement", "1", "data_identifier"}},
+                          "physicalMeasurement", "1", "data_identifier_i"}},
     {"integration_time", {nullptr, "Integration time used for the measurement",
-                           "auxiliaryInformation", "1", "data_identifier"}},
+                           "auxiliaryInformation", "1", "data_identifier_i"}},
     {"park_wavelength_nm", {nullptr, "Fixed centering value of the emission detector",
-                             "auxiliaryInformation", "1", "data_identifier"}},
-    {"ccd_gain_factor", {nullptr, "Detector gain factor", "auxiliaryInformation", "1", "data_identifier"}},
-    {"ccd_xbin", {nullptr, "Pixel binning of emission detector", "auxiliaryInformation", "1", "data_identifier"}},
+                             "auxiliaryInformation", "1", "data_identifier_i"}},
+    {"ccd_gain_factor", {nullptr, "Detector gain factor", "auxiliaryInformation", "1", "data_identifier_i"}},
+    {"ccd_xbin", {nullptr, "Pixel binning of emission detector", "auxiliaryInformation", "1", "data_identifier_i"}},
     {"workbook_name", {nullptr, "Sample identifier as retreived from the workbook property",
-                        "auxiliaryInformation", "1", "data_identifier"}},
+                        "auxiliaryInformation", "1", "data_identifier_i"}},
     {"workbook_short_name", {nullptr, "Sample identifier as retreived from the short identifier workbook property",
-                              "auxiliaryInformation", "1", "data_identifier"}},
+                              "auxiliaryInformation", "1", "data_identifier_i"}},
     {"source_opj_file", {nullptr, "File from which the measurements were extracted",
-                          "auxiliaryInformation", "1", "data_identifier"}},
-    // data_identifier acts as the sample-identifying coordinate that every
-    // other variable's "coordinates" attribute above points to (like
-    // excitation/emission for their own dimensions) - so, like those two,
-    // it's coverage_content_type "coordinate" and gets no coordinates
-    // attribute of its own.
+                          "auxiliaryInformation", "1", "data_identifier_i"}},
+    // data_identifier is no longer the coordinate variable - it doesn't
+    // even share a name with the dimension anymore, now that the
+    // dimension itself is named "data_identifier_i" (see writeBucket()'s
+    // addDim() comment); data_identifier_i (below) fills that role
+    // instead. data_identifier is a plain informational string, not
+    // referenced in any other variable's "coordinates" attribute, since a
+    // non-monotonic string can't validly serve as a CF coordinate (see
+    // data_identifier_i's own comment for why it exists at all).
     {"data_identifier", {nullptr, "Data identifier as provided prior to measurement",
-                          "coordinate", "1", nullptr}},
-    {"ccd_adc_readout", {nullptr, "Gain setting 1", "auxiliaryInformation", "1", "data_identifier"}},
-    {"ccd_gain", {nullptr, "Gain setting 2", "auxiliaryInformation", "1", "data_identifier"}},
+                          "auxiliaryInformation", "1", nullptr}},
+    {"ccd_adc_readout", {nullptr, "Gain setting 1", "auxiliaryInformation", "1", "data_identifier_i"}},
+    {"ccd_gain", {nullptr, "Gain setting 2", "auxiliaryInformation", "1", "data_identifier_i"}},
     {"experiment_file", {nullptr, "The XML file from which the measurement was orchestrated",
-                          "auxiliaryInformation", "1", "data_identifier"}},
+                          "auxiliaryInformation", "1", "data_identifier_i"}},
     {"creation_time", {nullptr, "Date and time at which the measurement finished.",
-                        "auxiliaryInformation", "1", "data_identifier"}},
+                        "auxiliaryInformation", "1", "data_identifier_i"}},
     {"modification_time", {nullptr, "Date and time at which the data processing finished.",
-                            "auxiliaryInformation", "1", "data_identifier"}},
+                            "auxiliaryInformation", "1", "data_identifier_i"}},
+    // The actual coordinate variable for the "data_identifier_i" dimension
+    // (the dimension itself is named after this variable, not after the
+    // data_identifier string - see writeBucket()'s addDim() comment) - a
+    // plain monotonically increasing integer index (1..N within each
+    // bucket), added because several compliance checkers (CF-checker in
+    // particular - see the compliance investigation) require a
+    // dimension's coordinate variable to hold monotonic values, which a
+    // string identifier that's deliberately allowed to repeat (see
+    // "SAMPLE IDENTITY" above) can never satisfy. data_identifier (the
+    // string) is kept as-is for human/provenance identification; this is
+    // purely the machine-facing, always-valid axis coordinate.
+    {"data_identifier_i", {nullptr,
+                            "Numeric, monotonically increasing data identifier, only unique within the dataset",
+                            "coordinate", "1", nullptr}},
 };
 
 void applyCfAttributes(NcVar var, const std::string& variableName)
@@ -1943,13 +1966,20 @@ void writeBucket(NcGroup scope, const std::vector<SampleRecord*>& bucket)
     size_t exCount = first.excitation.size();
     size_t emCount = first.emission.size();
 
-    // Named "data_identifier", not "sample": data_identifier is this
-    // dimension's coordinate variable (see kCfAttributes - it's the one
-    // thing every other variable's own "coordinates" attribute points
-    // back to, just like excitation/emission are for their own
-    // dimensions), so the dimension and the coordinate variable that
-    // describes it share a name, per the usual CF/netCDF convention.
-    NcDim sampleDim = scope.addDim("data_identifier", bucket.size());
+    // Named "data_identifier_i", not "sample" or "data_identifier":
+    // data_identifier_i is this dimension's actual CF coordinate variable
+    // (see kCfAttributes) - a plain monotonically increasing integer
+    // index, sharing the dimension's name per the usual CF/netCDF
+    // convention. It exists specifically because the human-readable
+    // "data_identifier" string can't fill that role: CF compliance
+    // checkers identify a dimension's coordinate variable purely by name
+    // match, and would then require it to hold strictly monotonic
+    // values - which data_identifier is deliberately allowed to violate
+    // (see "SAMPLE IDENTITY" above, on repeat measurements sharing an
+    // identifier). Keeping the dimension itself named after the string
+    // would have left it wrongly holding that role no matter what
+    // attributes were set on it.
+    NcDim sampleDim = scope.addDim("data_identifier_i", bucket.size());
     NcDim exDim = scope.addDim("excitation", exCount);
     NcDim emDim = scope.addDim("emission", emCount);
 
@@ -2079,6 +2109,18 @@ void writeBucket(NcGroup scope, const std::vector<SampleRecord*>& bucket)
     NcVar dataIdentifierVar = writeSampleStringVar(scope, sampleDim, "data_identifier", bucket, &SampleRecord::dataIdentifier);
     applyCfAttributes(dataIdentifierVar, "data_identifier");
     applyMissingValueString(dataIdentifierVar);
+
+    // 1-based, monotonically increasing within this bucket - matches
+    // drEEM's own convention for a plain sample index (DS.i=(1:nSample)').
+    // See kCfAttributes's own comment for why this variable exists.
+    NcVar dataIdentifierIVar = scope.addVar("data_identifier_i", ncInt, sampleDim);
+    applyCfAttributes(dataIdentifierIVar, "data_identifier_i");
+    applyMissingValueInt(dataIdentifierIVar);
+    for (size_t i = 0; i < bucket.size(); i++)
+    {
+        int value = static_cast<int>(i) + 1;
+        dataIdentifierIVar.putVar({i}, {1}, &value);
+    }
 
     NcVar adcReadoutVar = writeSampleStringVar(scope, sampleDim, "ccd_adc_readout", bucket, &SampleRecord::ccdAdcReadout);
     applyCfAttributes(adcReadoutVar, "ccd_adc_readout");
@@ -2378,7 +2420,7 @@ int main(int argc, char* argv[])
         // file other than the first file that used it. This is a
         // FAIR-findability flag, not a correctness problem - the samples
         // are still fully exported with their own real values, unique
-        // position along the data_identifier dimension, and everything
+        // position along the data_identifier_i dimension, and everything
         // else intact; the tag just tells a downstream reader "this
         // identifier isn't unique across the dataset" so they can look
         // closer if they want to.
@@ -2446,7 +2488,10 @@ int main(int argc, char* argv[])
         nc.putAtt("standard_name_vocabulary", "CF Standard Name Table v94");
         nc.putAtt("source", "physicalMeasurement");
         nc.putAtt("cdm_data_type", "grid");
-        nc.putAtt("comment", "This file was produced using the C++ tool aqualog2nc: https://github.com/urbanwuensch/aqualog2nc");
+        nc.putAtt("comment", "This file was produced using the C++ tool aqualog2nc: "
+                             "https://github.com/urbanwuensch/aqualog2nc in the version specified by the "
+                             "attribute version_aqualog2nc. DOI: 10.5281/zenodo.21928518");
+        nc.putAtt("version_aqualog2nc", "v1.0.0");
 
         // date_created/date_issued: both this export's own wall-clock
         // time - genuinely known (unlike a sample's own creation/
