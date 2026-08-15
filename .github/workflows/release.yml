@@ -104,7 +104,7 @@ jobs:
           Copy-Item $exe.FullName "${{ matrix.artifact }}.exe"
 
       - name: Sanity-check for stray dynamic dependencies (Linux)
-        if: matrix.os == 'ubuntu-latest'
+        if: matrix.os == 'ubuntu-22.04'
         run: |
           echo "Reviewing dynamic dependencies - should be base libc/libstdc++/libm only:"
           ldd "${{ matrix.artifact }}" || true
