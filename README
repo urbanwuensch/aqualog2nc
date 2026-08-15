@@ -59,8 +59,8 @@ that indexes on that kind of metadata.
 	- NetCDF file will appear in the current directory of the terminal (not the directory with the OPJ files)
 
 3. drEEM-bundle
-	- Use ds=drEEMtoolbox.aqualogimport(folder). The toolbox automatically downloads the OS-specific version of aqualog2nc and does the hard work for you.
-	- Use [samples,blanks] = drEEMtoolbox.processHJYdata(ds) to get fully corrected samples, absorbance scans, and blanks! Done.
+	- Use [samples,blanks]=drEEMtoolbox.importaqualog(folder). The toolbox automatically downloads the OS-specific version of aqualog2nc, drEEM reproduces
+	  the corrections so you get absorbance and fluorescence as you'd expect it to look.
 
 
 ## STRUCTURE OF THE NETCDF FILE
