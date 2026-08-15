@@ -141,6 +141,20 @@ if (BUILD_STATIC_LIBS)
         origin_static
         netCDF::netcdf-cxx4
     )
+    # Statically link libstdc++/libgcc into the Linux binary, so it
+    # doesn't depend on the target system's own libstdc++.so.6 having a
+    # new enough GLIBCXX symbol version. ubuntu-latest's toolchain (what
+    # CI builds with) is newer than what many "stable" distros ship
+    # (e.g. GLIBCXX_3.4.32, requiring roughly GCC 14) - without this, the
+    # released binary fails to start on those systems with an error like
+    # "version `GLIBCXX_3.4.32' not found". Only the base libc is left as
+    # a dynamic dependency, which has much stronger cross-distro ABI
+    # stability. No-op on macOS/Windows (MSVC's static CRT, set via
+    # CMAKE_MSVC_RUNTIME_LIBRARY above, already solves the equivalent
+    # problem there).
+    if (UNIX AND NOT APPLE)
+        target_link_options(aqualog2nc PRIVATE -static-libgcc -static-libstdc++)
+    endif ()
 
     # aqualog2nc uses std::filesystem (folder batch mode). This is part of
     # the standard library on all reasonably current compilers; only add
