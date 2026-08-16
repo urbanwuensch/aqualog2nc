@@ -2476,7 +2476,6 @@ int main(int argc, char* argv[])
         // so each gets its own group.
         NcFile nc(argv[2], NcFile::replace);
         nc.putAtt("Conventions", "CF-1.13, ACDD-1.3");
-        nc.putAtt("source_input", argv[1]);
 
         // ACDD discovery/provenance attributes, per "netcdf variable
         // attributes.xlsx" 's "Global attributes" sheet.
@@ -2490,8 +2489,8 @@ int main(int argc, char* argv[])
         nc.putAtt("cdm_data_type", "grid");
         nc.putAtt("comment", "This file was produced using the C++ tool aqualog2nc: "
                              "https://github.com/urbanwuensch/aqualog2nc in the version specified by the "
-                             "attribute version_aqualog2nc. DOI: 10.5281/zenodo.21928518");
-        nc.putAtt("version_aqualog2nc", "v1.0.0");
+                             "attribute version_aqualog2nc. DOI: 10.5281/zenodo.21961575");
+        nc.putAtt("version_aqualog2nc", "v1.0.2");
 
         // date_created/date_issued: both this export's own wall-clock
         // time - genuinely known (unlike a sample's own creation/
