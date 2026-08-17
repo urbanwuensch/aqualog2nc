@@ -231,6 +231,14 @@
 #include <unordered_map>
 #include <vector>
 
+// For currentProcessId() below - part of the temp-file naming scheme
+// used to write the output file safely (see writeOutputAtomically()).
+#ifdef _WIN32
+#include <process.h>
+#else
+#include <unistd.h>
+#endif
+
 using namespace netCDF;
 using namespace netCDF::exceptions;
 namespace fs = std::filesystem;
@@ -1089,6 +1097,104 @@ std::string currentUsername()
     if (!user || !*user)
         user = std::getenv("USERNAME");
     return (user && *user) ? user : "unknown";
+}
+
+// Portable current process ID - used only to help the temp output file
+// (see tempOutputPath() below) avoid colliding with a concurrent or
+// stale-leftover run; not a security-sensitive use, so plain _getpid()/
+// getpid() is fine without any extra privilege/namespacing concerns.
+long currentProcessId()
+{
+#ifdef _WIN32
+    return _getpid();
+#else
+    return static_cast<long>(getpid());
+#endif
+}
+
+// Returns a temp file path in the same directory as `finalPath`, named
+// after it with a timestamp+PID suffix. Same directory is what matters
+// most here: it's what makes the final rename (see the writing code in
+// main()) a same-filesystem, atomic rename on every platform, rather
+// than a cross-filesystem copy+delete that would lose that guarantee
+// (std::filesystem::rename() only stays atomic within one filesystem).
+// The timestamp+PID suffix (not just a fixed ".tmp") avoids collision
+// with a concurrent run targeting the same output path, and makes a
+// stale leftover - from a run killed hard enough to skip even the
+// exception-based cleanup below - identifiable by roughly when and from
+// which process it came from, rather than an anonymous ".tmp" file.
+fs::path tempOutputPath(const fs::path& finalPath)
+{
+    std::string suffix = "." + std::to_string(static_cast<long long>(std::time(nullptr))) + "." +
+                          std::to_string(currentProcessId()) + ".tmp";
+    fs::path result = finalPath;
+    result += suffix;
+    return result;
+}
+
+// Deletes the temp file it was constructed with, unless commit() was
+// called first - RAII cleanup so a temp file never gets left behind
+// after an exception, no matter which of writeBucket()'s many possible
+// throw points is hit. Best-effort: if the delete itself fails there's
+// nothing more useful this program can do about it.
+class TempFileGuard
+{
+public:
+    explicit TempFileGuard(fs::path path) : path_(std::move(path)) {}
+    ~TempFileGuard()
+    {
+        if (!committed_)
+        {
+            std::error_code ec;
+            fs::remove(path_, ec);
+        }
+    }
+    void commit() { committed_ = true; }
+
+private:
+    fs::path path_;
+    bool committed_ = false;
+};
+
+// Best-effort, non-destructive check that the final output path looks
+// writable, meant to be run once up front - before the potentially long
+// collection phase - so a locked/permission-denied destination (a file
+// held open by another program, an antivirus/sync-client lock, or a
+// read-only folder) is reported in under a second instead of only after
+// the full export has already run. Never truncates or deletes anything
+// that was already there: an existing file is opened for read+write
+// without truncating, and a nonexistent one is created then immediately
+// removed again. This is TOCTOU-prone - passing here does not guarantee
+// the rename at the end of main() will succeed, since the lock can
+// appear (or the disk can fill up) in between - so it's a fast-fail
+// convenience on top of the atomic temp-file-then-rename, not a
+// replacement for its own error handling.
+bool checkOutputPathWritable(const fs::path& finalPath, std::string& errorDetail)
+{
+    if (fs::exists(finalPath))
+    {
+        std::fstream existing(finalPath, std::ios::in | std::ios::out | std::ios::binary);
+        if (!existing.is_open())
+        {
+            errorDetail = "the file already exists but could not be opened for writing (it may be "
+                          "open in another program, locked by a sync client, or you may lack "
+                          "permission)";
+            return false;
+        }
+        return true;
+    }
+
+    std::ofstream probe(finalPath, std::ios::out | std::ios::binary);
+    if (!probe.is_open())
+    {
+        errorDetail = "the destination folder does not allow creating a file there (check the path "
+                      "and your write permission)";
+        return false;
+    }
+    probe.close();
+    std::error_code ec;
+    fs::remove(finalPath, ec);
+    return true;
 }
 
 // The one "history" line that on its own satisfies the full NetCDF
@@ -2165,6 +2271,20 @@ int main(int argc, char* argv[])
 
     std::cout << "Found " << opjFiles.size() << " .opj/.ogw file(s)\n";
 
+    // Fail fast if the destination is obviously unwritable, rather than
+    // running the full (potentially slow) export first - see
+    // checkOutputPathWritable()'s comment for what this does and doesn't
+    // guarantee.
+    {
+        std::string writabilityError;
+        if (!checkOutputPathWritable(fs::path(argv[2]), writabilityError))
+        {
+            std::cerr << "Error: output path \"" << argv[2] << "\" does not look writable right now - "
+                      << writabilityError << ". Not starting the export.\n";
+            return 1;
+        }
+    }
+
     try
     {
         // Phase 1: collect every exported sample from every input file
@@ -2474,7 +2594,17 @@ int main(int argc, char* argv[])
         // everything goes straight into the file's root. More than one
         // bucket means the input spans genuinely different configurations,
         // so each gets its own group.
-        NcFile nc(argv[2], NcFile::replace);
+        //
+        // Written to a temp file first, renamed onto the real requested
+        // path only once everything below has fully succeeded - see
+        // tempOutputPath()/TempFileGuard's own comments for why. Nothing
+        // else in this function changes: every nc.* call below still
+        // targets the same in-progress file, this just changes which
+        // physical filename that file has until the very end.
+        fs::path finalOutputPath(argv[2]);
+        fs::path tempPath = tempOutputPath(finalOutputPath);
+        NcFile nc(tempPath.string(), NcFile::replace);
+        TempFileGuard tempGuard(tempPath);
         nc.putAtt("Conventions", "CF-1.13, ACDD-1.3");
 
         // ACDD discovery/provenance attributes, per "netcdf variable
@@ -2601,6 +2731,38 @@ int main(int argc, char* argv[])
             }
             nc.putAtt("history", history);
         }
+
+        // Everything above has fully succeeded - only now does the real
+        // requested filename get touched at all. Close the temp file
+        // explicitly (rather than relying on nc's destructor) so it's
+        // guaranteed flushed before the rename, then move it into
+        // place. If the rename itself fails (e.g. something else has
+        // the target filename open - see the Windows GLIBCXX/OneDrive
+        // investigation this was built for), the completed data isn't
+        // lost: it's sitting at tempPath, and this says so explicitly
+        // rather than leaving the user to guess.
+        nc.close();
+        {
+            std::error_code ec;
+            fs::rename(tempPath, finalOutputPath, ec);
+            if (ec)
+            {
+                // The write itself succeeded - only the rename didn't -
+                // so this is exactly the one failure case where the temp
+                // file must survive rather than be cleaned up: commit()
+                // before returning, since TempFileGuard's destructor
+                // would otherwise delete it during the stack unwinding
+                // this return triggers, directly contradicting the
+                // message just printed.
+                tempGuard.commit();
+                std::cerr << "Error: export finished successfully, but could not move the "
+                          << "completed file into place at \"" << outputPath << "\" (" << ec.message()
+                          << "). The finished file is available at \"" << fs::absolute(tempPath).string()
+                          << "\" - move it there yourself.\n";
+                return 1;
+            }
+        }
+        tempGuard.commit();
 
         std::cout << "Wrote " << allSamples.size() << " sample(s) across " << buckets.size()
                   << " measurement type(s) to " << outputPath << "\n";
